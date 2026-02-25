@@ -23,36 +23,16 @@ hf_set_seed(seed)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+
 class CosineDataset(Dataset):
-    def __init__(self, num_samples: int = 10000, seq_len: int = 128):
-        # super().__init__()
-        # self.seq_len = seq_len
-
-        # t = torch.linspace(0, 2*math.pi, steps=10000)
-        # data = torch.cos(t)  # [T_total]
-        
-        # # 生成一长段 cos 序列
-        # # t = torch.linspace(0, 25, steps=num_samples + seq_len + 1)
-        # # data = torch.cos(t)  # [T_total]
-
-        # xs, ys = [], []
-        # for i in range(num_samples):
-        #     x = data[i:i + seq_len]          # 输入: 长度 L
-        #     y = data[i + 1:i + seq_len + 1]  # 标签: 向右平移 1
-        #     xs.append(x)
-        #     ys.append(y)
-        # self.x = torch.stack(xs).unsqueeze(-1)  # [N, L, 1]
-        # self.y = torch.stack(ys).unsqueeze(-1)  # [N, L, 1]
-        
+    def __init__(self, num_samples: int = 10000, seq_len: int = 128):        
         super().__init__()
         self.seq_len = seq_len
 
-        # 以 π/8 为步长：0, π/8, 2π/8, 3π/8, ...
         step = math.pi / 8
-        # 需要的总点数 = 可取样的起点个数 num_samples + 每段长度 seq_len + 1（因为要右移一位做 label）
-        total_points = num_samples + seq_len + 1
-        t = torch.arange(total_points, dtype=torch.float32) * step   # [total_points]
-        data = torch.cos(t)*4                                          # [total_points]
+        total_points = num_samples + seq_len
+        t = torch.arange(total_points, dtype=torch.float32) * step
+        data = torch.cos(t) * 4
 
         xs, ys = [], []
         for i in range(num_samples):
@@ -73,10 +53,15 @@ class CosineDataset(Dataset):
         }
 
 
+def _count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(42)
-
+    
     num_samples = 1024
     seq_len = 128
     batch_size = 64
@@ -89,17 +74,20 @@ def train():
     cfg_path = os.path.join(os.path.dirname(__file__), "configs/timekimi_config.json")
     with open(cfg_path, "r", encoding="utf-8") as f:
         config = json.load(f)
-    config["input_size"] = 1    # 输入维度：单变量时间序列
+    config["input_size"] = 1
 
     config = KimiLinearConfig(**config)
     model = KimiLinearTimeModel(config).to(device).to(torch.bfloat16)
     model.train()
+    
+    total, trainable = _count_params(model)
+    print(f"Total params: {total:,} ({total/1e6:.2f}M)")
+    print(f"Trainable params: {trainable:,} ({trainable/1e6:.2f}M)")
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
     every_log_steps = 10
-    step = 0
     epoch_losses = []
     global_step = 0
     
@@ -107,22 +95,22 @@ def train():
         total_loss = 0.0
 
         for batch in dataloader:
-            inputs = batch["inputs"].to(device)   # [B, L, 1]  作为 x[t]
-            labels = batch["labels"].to(device)   # [B, L, 1]  作为 x[t+1]
+            inputs = batch["inputs"].to(device)
+            labels = batch["labels"].to(device)
 
-            optimizer.zero_grad(set_to_none=True)
-
-            # 训练期不使用 cache：并行更快，显存更省
+            optimizer.zero_grad()
+            
             preds, _ = model(
                 input_ids=inputs,   # 对 TimeModel 来说是连续值序列
                 use_cache=False,
             )  # preds: [B, L, input_size]
 
             loss = criterion(preds, labels)
-
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)   # 模型整体参数的梯度缩放
+            
             optimizer.step()
 
             total_loss += float(loss.detach().cpu())

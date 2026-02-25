@@ -45,14 +45,10 @@ def autoregressive_rollout(
     rollout_len: int,
     use_cache: bool = True,
 ):
-    """
-    返回 preds: [B, rollout_len, 1]
-    """
     model.eval()
 
     past = None
 
-    # 1) 用 context 建 cache，并拿到“预测下一个点”的输出（取最后一个位置）
     out, past = model(
         input_ids=context,
         past_key_values=past,
@@ -62,7 +58,6 @@ def autoregressive_rollout(
 
     preds = [next_token]
 
-    # 2) 纯自回归：后续每一步只喂上一步预测
     for _ in range(1, rollout_len):
         out_step, past = model(
             input_ids=next_token,
@@ -72,7 +67,7 @@ def autoregressive_rollout(
         next_token = out_step[:, -1:, :]
         preds.append(next_token)
 
-    preds = torch.cat(preds, dim=1)  # [B, rollout_len, 1]
+    preds = torch.cat(preds, dim=1)
     return preds
 
 
@@ -81,7 +76,7 @@ def main():
     parser.add_argument("--ckpt_dir", type=str, default="timekimi_ckpt")
     parser.add_argument("--num_samples", type=int, default=1024)
     parser.add_argument("--seq_len", type=int, default=128)
-    parser.add_argument("--sample_idx", type=int, default=0)
+    parser.add_argument("--sample_idx", type=int, default=1)
     parser.add_argument("--context_len", type=int, default=32)
     parser.add_argument("--rollout_len", type=int, default=64)
     parser.add_argument("--out_png", type=str, default="inference_rollout.png")
@@ -90,7 +85,6 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
-    # 载入 config + 权重
     cfg_path = os.path.join(args.ckpt_dir, "config.json")
     weight_path = os.path.join(args.ckpt_dir, "pytorch_model.bin")
     if not os.path.exists(cfg_path):
@@ -107,7 +101,6 @@ def main():
     model.load_state_dict(sd, strict=True)
     model.eval()
 
-    # 数据
     ds = CosineDataset(num_samples=args.num_samples, seq_len=args.seq_len)
     sample = ds[args.sample_idx]
     x = sample["inputs"].to(torch.bfloat16).unsqueeze(0).to(device=device, dtype=dtype)   # [1, L, 1]
@@ -115,26 +108,19 @@ def main():
 
     assert args.context_len >= 1
     assert args.context_len <= args.seq_len
-    # 目标对齐：context 的最后一个位置预测的是 labels 的 index = context_len-1
+    
     max_roll = args.seq_len - (args.context_len - 1)
     rollout_len = min(args.rollout_len, max_roll)
 
     context = x[:, : args.context_len, :]  # [1, C, 1]
 
-    # 自回归 rollout（用 cache）
-    if device.type == "cuda":
-        preds = autoregressive_rollout(model, context, rollout_len=rollout_len, use_cache=True)
-    else:
-        preds = autoregressive_rollout(model, context, rollout_len=rollout_len, use_cache=True)
+    preds = autoregressive_rollout(model, context, rollout_len=rollout_len, use_cache=True)
 
-    # GT：labels 从 (context_len-1) 开始往后 rollout_len 个
     gt = y[:, (args.context_len - 1) : (args.context_len - 1 + rollout_len), :]  # [1, rollout_len, 1]
 
-    # 计算 MSE（仅用于观测）
     mse = torch.mean((preds.float() - gt.float()) ** 2).item()
     print(f"device={device}, dtype={dtype}, rollout_len={rollout_len}, mse={mse:.6f}")
 
-    # 画图（转 float32）
     gt_np = gt[0, :, 0].float().cpu().numpy()
     pd_np = preds[0, :, 0].float().cpu().numpy()
 

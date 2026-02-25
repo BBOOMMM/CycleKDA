@@ -156,11 +156,7 @@ class KimiLinearModel(KimiPreTrainedModel):
 class KimiLinearTimeModel(KimiPreTrainedModel):
     def __init__(self, config: KimiLinearConfig):
         super().__init__(config)
-        # self.padding_idx = config.pad_token_id
-        # self.vocab_size = config.vocab_size
-
-        # self.embed_tokens = nn.Embedding(
-            # config.vocab_size, config.hidden_size, self.padding_idx)
+        
         self.embed_tokens = nn.Linear(config.input_size, config.hidden_size)
         self.layers = nn.ModuleList([KimiDecoderLayer(
             config, layer_idx) for layer_idx in range(config.num_hidden_layers)])

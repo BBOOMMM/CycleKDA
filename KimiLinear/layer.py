@@ -15,6 +15,7 @@ class KimiDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
+        
         if config.is_kda_layer(layer_idx):
             self.is_linear_attn = True
             self.self_attn = KimiDeltaAttention(
@@ -25,6 +26,7 @@ class KimiDecoderLayer(nn.Module):
                 config=config, layer_idx=layer_idx)
         else:
             raise NotImplementedError
+        
         # if (
         #     config.num_experts is not None
         #     and layer_idx >= config.first_k_dense_replace
@@ -33,6 +35,7 @@ class KimiDecoderLayer(nn.Module):
         #     self.block_sparse_moe = KimiSparseMoeBlock(config)
         # else:
         self.mlp = KimiMLP(config)
+        
         self.input_layernorm = KimiRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = KimiRMSNorm(

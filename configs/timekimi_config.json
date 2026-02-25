@@ -33,7 +33,7 @@
     "num_heads": 8,
     "head_dim": 64,
     "short_conv_kernel_size": 4,
-    "full_attn_layers": [0, 4],
+    "full_attn_layers": [4, 8],
     "kda_layers": [1, 2, 3, 5, 6, 7]
   },
 
