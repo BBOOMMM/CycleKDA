@@ -48,8 +48,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)   # i_nh = N * HV
-    i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
+    i_n, i_hv = i_nh // HV, i_nh % HV   # i_n 表示处理第几个样本，i_hv 表示处理 v 的第几个head
+    i_h = i_hv // (HV // H)  # 这里和 i_hv 一样
 
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
@@ -66,7 +66,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     # v (torch.Tensor):
     #     values of shape `[B, T, HV, V]`.
     #     GVA is applied if `HV > H`.
-    p_q = q + (bos * H + i_h) * K + o_k
+    # 取的是对应样本、对应head的分块q、k、v，均为向量，其中q、k是直接取一整行，v在行上进一步进行了切分
+    p_q = q + (bos * H + i_h) * K + o_k          # 现在是 t=0 时刻，后面对 i_t 进行循环，会加上 T 维度的 stride
     p_k = k + (bos * H + i_h) * K + o_k
     p_v = v + (bos * HV + i_hv) * V + o_v
     if USE_G:
@@ -76,6 +77,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     if USE_GV:
         p_gv = gv + (bos * HV + i_hv) * V + o_v
     if IS_BETA_HEADWISE:
+        # 走这里
         p_beta = beta + bos * HV + i_hv
     else:
         p_beta = beta + (bos * HV + i_hv) * V + o_v
@@ -84,15 +86,16 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
     mask_k = o_k < K
     mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
+    mask_h = mask_k[:, None] & mask_v[None, :]   # [BK, 1] & [1, BV]
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)  # [BK, BV]
     if USE_INITIAL_STATE:
         p_h0 = h0 + i_nh * K*V + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
-    for i_t in range(0, T):
-        curr_t = initial_t + i_t
+    # b_h 不应该被反复修改，只需要在 cur_t % T_cycle == 0 时刻更新，在 b_h 基础上计算得到 b_h_top 即可
+    for i_t in range(0, T):    
+        b_h_top = b_h + 0.0   # 作为副本, +0.0 强制 Triton 分配新寄存器
         
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)  # [BK]
         b_k = tl.load(p_k, mask=mask_k, other=0).to(tl.float32)  # [BK]
@@ -102,36 +105,37 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
         b_q = b_q * scale
         
-        if curr_t % T_cycle == 0:
-            if IS_BETA_HEADWISE:
-                b_beta = tl.load(p_beta).to(tl.float32)
-            else:
-                b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+        cur_t = initial_t + i_t
+        rho_t = 1.0 if cur_t % T_cycle == 0 else (cur_t % T_cycle).to(tl.float32) / T_cycle
+        
+        if IS_BETA_HEADWISE:
+            b_beta = tl.load(p_beta).to(tl.float32)
+        else:
+            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
+            
+        # [BK, BV]
+        if USE_G:
+            b_g = tl.load(p_g).to(tl.float32)
+            b_h_top *= exp(b_g)
 
-            # [BK, BV]
-            if USE_G:
-                b_g = tl.load(p_g).to(tl.float32)
-                b_h *= exp(b_g)
+        if USE_GK:
+            b_gk = tl.load(p_gk).to(tl.float32)  # [BK]
+            b_h_top *= exp(b_gk[:, None])  # [BK, BV] * [BK, 1]  ->  [BK, BV] * [BK, BV]  发生广播
 
-            if USE_GK:
-                b_gk = tl.load(p_gk).to(tl.float32)  # [BK]
-                b_h *= exp(b_gk[:, None])  # [BK, BV] * [BK, 1]  ->  [BK, BV] * [BK, BV]  发生广播
-
-            if USE_GV:
-                b_gv = tl.load(p_gv).to(tl.float32)
-                b_h *= exp(b_gv[None, :])
-
-            b_v_update = b_beta * (b_v - tl.sum(b_h * b_k[:, None], 0))   # tl.sum(..., 0) 表示沿着 第 0 维（行方向） 进行求和，最后剩下一行，完成的是向量和矩阵相乘
-            b_h += b_k[:, None] * b_v_update   # [BK, 1] * [BV]  ->  [BK, 1] * [1, BV]  发生广播，外积
-
+        if USE_GV:
+            b_gv = tl.load(p_gv).to(tl.float32)
+            b_h_top *= exp(b_gv[None, :])
+        
+        b_v_update = rho_t * b_beta * (b_v - tl.sum(b_h_top * b_k[:, None], 0))   # tl.sum(..., 0) 表示沿着 第 0 维（行方向） 进行求和，最后剩下一行，完成的是向量和矩阵相乘
+        b_h_top += b_k[:, None] * b_v_update[None, :]   # [BK, 1] * [BV]  ->  [BK, 1] * [1, BV]  发生广播，外积
+        
         # [BV]
-        b_o = tl.sum(b_h * b_q[:, None], 0)
-        
-        coeff = (curr_t % T_cycle).to(tl.float32) / T_cycle
-        qk_dot = tl.sum(b_k * b_q)  # [BK] * [BK]
-        b_o += coeff * qk_dot * b_v
-        
+        b_o = tl.sum(b_h_top * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+        
+        if cur_t % T_cycle == 0 and cur_t != 0:
+            b_h = b_h_top
 
         p_q += H*K
         p_k += H*K
@@ -164,7 +168,7 @@ def fused_recurrent_gated_delta_rule_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     initial_t: int = 0,                # 新增：起始时间偏移（seen_tokens）
-    T_cycle: int = 8,                 # 新增：状态更新周期 T
+    T_cycle: int = 8,                  # 新增：状态更新周期 T
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
@@ -192,7 +196,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         scale=scale,
         T=T,
         initial_t=initial_t,                # 新增：起始时间偏移（seen_tokens）
-        T_cycle=T_cycle,                  # 新增：状态更新周期 T
+        T_cycle=T_cycle,                    # 新增：状态更新周期 T
         B=B,
         H=H,
         HV=HV,
@@ -227,7 +231,7 @@ class FusedRecurrentFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
         initial_t: int = 0,                # 新增：起始时间偏移（seen_tokens）
-        T_cycle: int = 8,                 # 新增：状态更新周期 T
+        T_cycle: int = 8,                  # 新增：状态更新周期 T
     ):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q,
@@ -272,7 +276,7 @@ def fused_recurrent_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     initial_t: int = 0,                # 新增：起始时间偏移（seen_tokens）
-    T_cycle: int = 8,                 # 新增：状态更新周期 T
+    T_cycle: int = 8,                  # 新增：状态更新周期 T
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -388,7 +392,7 @@ def fused_recurrent_kda(
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
     initial_t: int = 0,                # 新增：起始时间偏移（seen_tokens）
-    T_cycle: int = 8,                 # 新增：状态更新周期 T
+    T_cycle: int = 8,                  # 新增：状态更新周期 T
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
