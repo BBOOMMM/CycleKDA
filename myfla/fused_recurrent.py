@@ -106,7 +106,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_q = b_q * scale
         
         cur_t = initial_t + i_t
-        rho_t = 1.0 if cur_t % T_cycle == 0 else (cur_t % T_cycle).to(tl.float32) / T_cycle
+        rho_t = 1.0 if cur_t % T_cycle == 0 else (cur_t % T_cycle) / T_cycle
+        rho_t = rho_t.to(tl.float32)
         
         if IS_BETA_HEADWISE:
             b_beta = tl.load(p_beta).to(tl.float32)

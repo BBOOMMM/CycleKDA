@@ -151,12 +151,6 @@ class KimiDeltaAttention(nn.Module):
 
         if mode == 'chunk':   # 训练，或者推理第一步
             past_len = 0      # 训练，或者推理第一步  past_len 都是 0
-            t_indices = torch.arange(q_len, device=q.device).view(1, q_len, 1) + past_len
-            update_mask = (t_indices % self.T_cycle == 0).to(q.dtype)  # [1, T, 1]
-            beta = beta * update_mask            # beta 形状是 [B, T, H]    正常置零
-            g = g * update_mask[:, :, :, None]                  # g 形状是 [B, T, H, K]      希望门控系数是 1，后续还会 exp，所以 g 也置零
-            # 因为每个头的隐藏状态大小是 K * K, 所以 g 形状是 H*K
-            # g = rearrange(g, '... (h d) -> ... h d', d=self.head_dim)
             o, recurrent_state = chunk_kda(
                 q=q,
                 k=k,
@@ -185,6 +179,8 @@ class KimiDeltaAttention(nn.Module):
                 initial_t=past_len,
                 T_cycle=self.T_cycle,
             )
+        
+        
         if cache_params is not None:
             cache_params.recurrent_states[self.layer_idx] = recurrent_state
             cache_params.conv_states[self.layer_idx] = (
