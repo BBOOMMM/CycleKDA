@@ -48,8 +48,8 @@ def test_chunk_kda():
                             T_cycle=8,
                             use_triton=True,
                         )
-    print(f"Recurrent output shape: {o_triton.shape}")
-    print(f"Recurrent output mean: {o_triton.mean().item():.6f}")
+    print(f"Triton output shape: {o_triton.shape}")
+    print(f"Triton output mean: {o_triton.mean().item():.6f}")
     
     o_diff = (o_triton - o_pytorch).abs()
     print(f"\nOutput Max diff: {o_diff.max().item():.6f}")

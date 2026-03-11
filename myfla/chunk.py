@@ -142,90 +142,101 @@ class ChunkKDAFunction_pytorch(torch.nn.Module):
             k, k_rstd = l2norm_fwd(k)
 
         chunk_size = 64
+        C = chunk_size
 
-        B, T, H, K, V, C = *k.shape, v.shape[-1], chunk_size
+        B, T, H, K = k.shape
+        V = v.shape[-1]
         N = (T + C - 1) // C
 
-        q, k, v, g, beta = map(
-            lambda x: rearrange(x, 'b (n c) h ... -> b h n c ...', c=C), [q, k, v, g, beta]
-        )
-        q = q * scale
+        # 输出按原始 [B, T, H, V] 组织，避免 rearrange 要求 T% C==0
+        o = torch.empty((B, T, H, V), device=v.device, dtype=v.dtype)
 
+        # state 用 float32
         S = torch.zeros((B, H, K, V), device=k.device, dtype=torch.float32)
         if initial_state is not None:
             S = S + initial_state.to(torch.float32)
 
-        o = torch.zeros_like(v)
+        # q 在这里做 scale（与原逻辑一致）
+        q = q * scale
 
-        for i in range(0, N):
-            q_i, k_i, v_i, g_i = q[:, :, i], k[:, :, i], v[:, :, i], g[:, :, i]
-            beta_i = beta[:, :, i]
-            q_i, k_i, v_i, g_i = q_i.to(torch.float32), k_i.to(torch.float32), v_i.to(torch.float32), g_i.to(torch.float32)
+        for i in range(N):
+            start = i * C
+            end = min((i + 1) * C, T)
+            L = end - start
+            if L <= 0:
+                continue
 
-            cur_t_start = initial_t + i * C
-            t_math = cur_t_start + torch.arange(0, C, device=q.device)
+            # 切片后转成 [B, H, L, ...] 以复用原 einsum 写法
+            q_i = q[:, start:end].permute(0, 2, 1, 3).to(torch.float32)      # [B,H,L,K]
+            k_i = k[:, start:end].permute(0, 2, 1, 3).to(torch.float32)      # [B,H,L,K]
+            v_i = v[:, start:end].permute(0, 2, 1, 3).to(torch.float32)      # [B,H,L,V]
+            g_i = g[:, start:end].permute(0, 2, 1, 3).to(torch.float32)      # [B,H,L,K]
+            beta_i = beta[:, start:end].permute(0, 2, 1).to(torch.float32)   # [B,H,L]
+
+            cur_t_start = initial_t + start
+            t_math = cur_t_start + torch.arange(L, device=q.device)
             mod_t = t_math % T_cycle
 
-            rho = torch.where(mod_t == 0, 1.0, mod_t / T_cycle)
-            rho = rho.view(1, 1, C).to(torch.float32)
-
+            rho = torch.where(mod_t == 0, 1.0, mod_t.to(torch.float32) / T_cycle)  # [L]
+            rho = rho.view(1, 1, L)  # [1,1,L]
             beta_i = beta_i * rho
 
             alpha_i = torch.exp(g_i)
 
             update_indices = torch.nonzero(mod_t == 0, as_tuple=True)[0].tolist()
 
-            S_curr = S  # float32
+            S_curr = S
             last_update_j = -1
 
-            def compute_o_segment(start_idx, end_idx):
+            def compute_o_segment(start_idx: int, end_idx: int):
                 if start_idx > end_idx:
                     return
-                q_seg = q_i[:, :, start_idx:end_idx+1]
-                k_seg = k_i[:, :, start_idx:end_idx+1]
-                v_seg = v_i[:, :, start_idx:end_idx+1]
-                a_seg = alpha_i[:, :, start_idx:end_idx+1]
-                b_seg = beta_i[:, :, start_idx:end_idx+1]
+                q_seg = q_i[:, :, start_idx : end_idx + 1]   # [B,H,S,K]
+                k_seg = k_i[:, :, start_idx : end_idx + 1]   # [B,H,S,K]
+                v_seg = v_i[:, :, start_idx : end_idx + 1]   # [B,H,S,V]
+                a_seg = alpha_i[:, :, start_idx : end_idx + 1]
+                b_seg = beta_i[:, :, start_idx : end_idx + 1]  # [B,H,S]
 
-                c_seg = (b_seg * torch.einsum('bhlk, bhlk -> bhl', q_seg, k_seg)).unsqueeze(-1)
+                c_seg = (b_seg * torch.einsum("bhlk,bhlk->bhl", q_seg, k_seg)).unsqueeze(-1)  # [B,H,S,1]
 
-                # 用 float32 的 S 做累积更稳
                 aq_seg = a_seg * q_seg
-                term1 = torch.einsum('bhkv, bhlk -> bhlv', S_curr, aq_seg)
+                term1 = torch.einsum("bhkv,bhlk->bhlv", S_curr, aq_seg)
 
                 ak_seg = a_seg * k_seg
-                S_ak = torch.einsum('bhkv, bhlk -> bhlv', S_curr, ak_seg)
+                S_ak = torch.einsum("bhkv,bhlk->bhlv", S_curr, ak_seg)
                 term2 = c_seg * S_ak
 
                 term3 = c_seg * v_seg
-                o[:, :, i, start_idx:end_idx+1] = term1 - term2 + term3
+                out_seg = term1 - term2 + term3  # [B,H,S,V]
+
+                # 写回到 [B,T,H,V]
+                o[:, start + start_idx : start + end_idx + 1] = out_seg.permute(0, 2, 1, 3).to(v.dtype)
 
             for j in update_indices:
                 compute_o_segment(last_update_j + 1, j)
-                
                 last_update_j = j
-                
-                if cur_t_start + j==0:
+
+                # 对齐原逻辑：t_global==0 时跳过状态更新
+                if cur_t_start + j == 0:
                     continue
 
-                a_j = alpha_i[:, :, j, :].unsqueeze(-1)  # [B,H,K,1]
-                k_j = k_i[:, :, j, :]                    # [B,H,K]
-                v_j = v_i[:, :, j, :]                    # [B,H,V]
-                b_j = beta_i[:, :, j].unsqueeze(-1)      # [B,H,1]
+                a_j = alpha_i[:, :, j, :].unsqueeze(-1)   # [B,H,K,1]
+                k_j = k_i[:, :, j, :]                     # [B,H,K]
+                v_j = v_i[:, :, j, :]                     # [B,H,V]
+                b_j = beta_i[:, :, j].unsqueeze(-1)        # [B,H,1]
 
                 a_S = a_j * S_curr
-                k_a_S = torch.einsum('bhk, bhkv -> bhv', k_j, a_S)
+                k_a_S = torch.einsum("bhk,bhkv->bhv", k_j, a_S)
                 b_k = b_j * k_j
-                S_curr = a_S - torch.einsum('bhk, bhv -> bhkv', b_k, k_a_S) + torch.einsum('bhk, bhv -> bhkv', b_k, v_j)
+                S_curr = a_S - torch.einsum("bhk,bhv->bhkv", b_k, k_a_S) + torch.einsum("bhk,bhv->bhkv", b_k, v_j)
 
-            compute_o_segment(last_update_j + 1, C - 1)
+            compute_o_segment(last_update_j + 1, L - 1)
             S = S_curr
-
-        o = rearrange(o, 'b h n c v -> b (n c) h v').to(v.dtype)
 
         if output_final_state:
             return o, S
         return o, None
+# ...existing code...
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -268,7 +279,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         chunk_size = 64
         
         
-        o, Aqk, Akk, final_state = chunk_kda_fwd(
+        o, Aqk, final_state = chunk_kda_fwd(
             q=q,
             k=k,
             v=v,
@@ -284,19 +295,19 @@ class ChunkKDAFunction(torch.autograd.Function):
         )
         
         
-        if use_gate_in_kernel:
-            g = None
+        # if use_gate_in_kernel:
+        #     g = None
         
         
-        ctx.save_for_backward(
-            q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, Akk, initial_state, cu_seqlens, chunk_indices
-        )
-        ctx.chunk_size = chunk_size
-        ctx.scale = scale
-        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        ctx.use_gate_in_kernel = use_gate_in_kernel
-        ctx.initial_t = initial_t     # 新增：用于 bwd
-        ctx.T_cycle = T_cycle         # 新增：用于 bwd
+        # ctx.save_for_backward(
+        #     q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, initial_state, cu_seqlens, chunk_indices
+        # )
+        # ctx.chunk_size = chunk_size
+        # ctx.scale = scale
+        # ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        # ctx.use_gate_in_kernel = use_gate_in_kernel
+        # ctx.initial_t = initial_t     # 新增：用于 bwd
+        # ctx.T_cycle = T_cycle         # 新增：用于 bwd
         return o.to(q.dtype), final_state
     
     
@@ -328,7 +339,6 @@ def chunk_kda_fwd(
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
 ):
-    # 输入 shape 约定: q, k, v, g, beta 都已经被 flatten 成[B, T, H, D]
     B, T, H, K = q.shape
     V = v.shape[-1]
     C = chunk_size
@@ -337,64 +347,97 @@ def chunk_kda_fwd(
     o = torch.empty_like(v)
     Aqk = torch.empty((B, T, H), device=q.device, dtype=torch.float32)
     
-    # Kernel 1 和 Kernel 2 之间的桥梁：存储每块起点的状态
     chunk_states = torch.empty((B, H, N, K, V), device=q.device, dtype=torch.float32)
     
     final_state = None
     if output_final_state:
         final_state = torch.empty((B, H, K, V), device=q.device, dtype=torch.float32)
 
-    # ----- 执行 Kernel 1: 扫描状态 -----
+    # compute chunk_states 
+    BK = triton.next_power_of_2(K)
+    BV = triton.next_power_of_2(V)
     grid_state = (B * H, )
-    fused_chunk_kda_state_prep_kernel[grid_state](
-        k, v, g, beta, chunk_states, initial_state, final_state,
-        scale, initial_t, T_cycle, N, C, B, H, K, V,
+    chunk_kda_fwd_state_kernel[grid_state](
+        k,
+        v,
+        g,
+        beta,
+        chunk_states,
+        initial_state,
+        final_state,
+        initial_t,
+        T_cycle,
+        N,
+        C,
+        B,
+        T,
+        H,
+        K,
+        V,
+        BK,
+        BV,
         USE_INITIAL_STATE=(initial_state is not None),
-        STORE_FINAL_STATE=output_final_state
+        STORE_FINAL_STATE=output_final_state,
     )
 
-    # ----- 执行 Kernel 2: 极限并行计算输出 -----
     grid_output = (N, B * H)
-    fused_chunk_kda_parallel_output_kernel[grid_output](
-        q, k, v, g, beta, chunk_states, o, Aqk,
-        scale, initial_t, T_cycle, N, C, B, H, K, V
+    chunk_kda_fwd_output_kernel[grid_output](
+        q,
+        k,
+        v,
+        g,
+        beta,
+        chunk_states,
+        o,
+        Aqk,
+        scale,
+        initial_t,
+        T_cycle,
+        N,
+        C,
+        B,
+        T,
+        H,
+        K,
+        V,
+        BK,
+        BV,
     )
 
-    Akk = None # 本算法无需 Akk
-    return o, Aqk, Akk, final_state
+    return o, Aqk, final_state
 
 
 
-# @triton.autotune(
-#     configs=[
-#         # triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4]
-#         for num_stages in [2, 3, 4]
-#         # for BV in [32, 64]
-#     ],
-#     key=['H', 'K', 'V', 'C'],
-#     use_cuda_graph=USE_CUDA_GRAPH,
-#     **autotune_cache_kwargs,
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in [1, 2, 3, 4]
+    ],
+    key=['H', 'K', 'V', 'C'],
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
+)
 @triton.jit
-def fused_chunk_kda_state_prep_kernel(
-    k,
-    v,
-    g,
-    beta,
-    chunk_states,
-    initial_state,
+def chunk_kda_fwd_state_kernel(
+    k,              # [B, T, H, K]
+    v,              # [B, T, H, V]
+    g,              # [B, T, H, K]
+    beta,           # [B, T, H]
+    chunk_states,   # [B, H, N, K, V]
+    initial_state,  # [B, H, K, V]
     final_state,
-    scale,
-    initial_t, 
+    initial_t,
     T_cycle: tl.constexpr,
     N: tl.constexpr,
     C: tl.constexpr,
     B: tl.constexpr,
+    T: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr
 ):
@@ -402,100 +445,124 @@ def fused_chunk_kda_state_prep_kernel(
     i_b = i_bh // H
     i_h = i_bh % H
 
-    b_S = tl.zeros([K, V], dtype=tl.float32)
-    if USE_INITIAL_STATE:
-        p_h0 = initial_state + i_bh * K * V + tl.arange(0, K)[:, None] * V + tl.arange(0, V)[None, :]
-        b_S += tl.load(p_h0).to(tl.float32)
+    o_k = tl.arange(0, BK)
+    o_v = tl.arange(0, BV)
 
-    o_k = tl.arange(0, K)
-    o_v = tl.arange(0, V)
+    b_S = tl.zeros([BK, BV], dtype=tl.float32)
+    if USE_INITIAL_STATE:
+        p_h0 = initial_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
+        b_S += tl.load(p_h0, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
 
     for i_n in range(N):
-        # 1. 记录本 Chunk 初始的底座状态
         p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
-        tl.store(p_cs, b_S)
+        tl.store(p_cs, b_S, mask=(o_k < K)[:, None] & (o_v < V)[None, :])
 
-        # 2. 数学计算：找出本 Chunk 内的第一个跳变点 j
         start_t = initial_t + i_n * C
         rem = start_t % T_cycle
         j = (T_cycle - rem) if rem != 0 else 0
-        
-        # 处理 t=0 不更新的特殊情况
         if start_t == 0 and j == 0:
             j += T_cycle
-
-        # 3. 跨越式扫描（抛弃 for j in range(C)，性能起飞！）
+        
         while j < C:
             token_idx = i_n * C + j
-            offset = i_b * (N * C) * H + token_idx * H + i_h
-            
+
+            # batch stride 用真实 T
+            offset = i_b * T * H + token_idx * H + i_h
+
             p_k = k + offset * K + o_k
             p_v = v + offset * V + o_v
             p_g = g + offset * K + o_k
             p_b = beta + offset
-            
-            u_k = tl.load(p_k).to(tl.float32)
-            u_v = tl.load(p_v).to(tl.float32)
-            u_alpha = tl.exp(tl.load(p_g).to(tl.float32))
-            u_beta = tl.load(p_b).to(tl.float32)
-            
-            a_S = u_alpha[:, None] * b_S 
+
+            mask_tok = token_idx < T  # scalar mask
+
+            # token 越界时：u_k/u_v/u_beta=0，u_alpha=1（通过 g 的 other=0 达成）
+            u_k = tl.load(p_k, mask=(o_k < K) & mask_tok, other=0.0).to(tl.float32)
+            u_v = tl.load(p_v, mask=(o_v < V) & mask_tok, other=0.0).to(tl.float32)
+            u_alpha = tl.exp(tl.load(p_g, mask=(o_k < K) & mask_tok, other=0.0).to(tl.float32))
+            u_beta = tl.load(p_b, mask=mask_tok, other=0.0).to(tl.float32)
+
+            a_S = u_alpha[:, None] * b_S
             k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
             b_k = u_beta * u_k
-            
             b_S = a_S - b_k[:, None] * k_a_S[None, :] + b_k[:, None] * u_v[None, :]
-            
-            # 直接跳到下一个更新点
+
             j += T_cycle
 
     if STORE_FINAL_STATE:
         p_ht = final_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
-        tl.store(p_ht, b_S)
+        tl.store(p_ht, b_S, mask=(o_k < K)[:, None] & (o_v < V)[None, :])
         
         
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4]
+        for num_stages in [1, 2, 3, 4]
+    ],
+    key=['H', 'K', 'V', 'C'],
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
+)
 @triton.jit
-def fused_chunk_kda_parallel_output_kernel(
-    q, k, v, g, beta, chunk_states, o, Aqk,
-    scale, initial_t, T_cycle: tl.constexpr, N: tl.constexpr, C: tl.constexpr,
-    B: tl.constexpr, H: tl.constexpr, K: tl.constexpr, V: tl.constexpr
+def chunk_kda_fwd_output_kernel(
+    q, k, v, g, beta,
+    chunk_states,
+    o,
+    Aqk,
+    scale,
+    initial_t,
+    T_cycle: tl.constexpr,
+    N: tl.constexpr,
+    C: tl.constexpr,
+    B: tl.constexpr,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
 ):
     i_n = tl.program_id(0)
     i_bh = tl.program_id(1)
     i_b = i_bh // H
     i_h = i_bh % H
 
-    o_k = tl.arange(0, K)
-    o_v = tl.arange(0, V)
-    o_c = tl.arange(0, C) 
+    o_k = tl.arange(0, BK)
+    o_v = tl.arange(0, BV)
+    o_c = tl.arange(0, C)
 
-    # 1. 提取当前块的初始状态
     p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
-    b_S = tl.load(p_cs)
+    b_S = tl.load(p_cs, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
 
-    # 2. 一次性加载整个 Chunk
-    base_offset = i_b * N * C * H + i_n * C * H + i_h * K
-    p_q = q + (i_b * N * C * H + (i_n * C + o_c)[:, None] * H + i_h) * K + o_k[None, :]
-    p_k = k + (i_b * N * C * H + (i_n * C + o_c)[:, None] * H + i_h) * K + o_k[None, :]
-    p_v = v + (i_b * N * C * H + (i_n * C + o_c)[:, None] * H + i_h) * V + o_v[None, :]
-    p_g = g + (i_b * N * C * H + (i_n * C + o_c)[:, None] * H + i_h) * K + o_k[None, :]
-    p_b = beta + (i_b * N * C * H + (i_n * C + o_c) * H + i_h)
+    t = i_n * C + o_c
+    mask_t = t < T
 
-    b_q = tl.load(p_q).to(tl.float32) * scale
-    b_k = tl.load(p_k).to(tl.float32)
-    b_v = tl.load(p_v).to(tl.float32)
-    b_g = tl.load(p_g).to(tl.float32)
-    b_beta = tl.load(p_b).to(tl.float32)
+    # batch 内 stride 必须用真实 T
+    base_bth = (i_b * T * H)
+
+    p_q = q + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
+    p_k = k + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
+    p_v = v + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
+    p_g = g + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
+    p_b = beta + (base_bth + t * H + i_h)
+
+    b_q = tl.load(p_q, mask=mask_t[:, None] & (o_k < K)[None, :], other=0.0).to(tl.float32) * scale
+    b_k = tl.load(p_k, mask=mask_t[:, None] & (o_k < K)[None, :], other=0.0).to(tl.float32)
+    b_v = tl.load(p_v, mask=mask_t[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+    b_g = tl.load(p_g, mask=mask_t[:, None] & (o_k < K)[None, :], other=-float("inf")).to(tl.float32)
+    b_beta = tl.load(p_b, mask=mask_t, other=0.0).to(tl.float32)
 
     b_alpha = tl.exp(b_g)
+
     cur_t_global = initial_t + i_n * C + o_c
     mod_t = cur_t_global % T_cycle
     rho = tl.where(mod_t == 0, 1.0, mod_t.to(tl.float32) / T_cycle)
     b_beta_tilde = b_beta * rho
 
-    b_o = tl.zeros([C, V], dtype=tl.float32)
-    
-    # 3. 数学寻找起始更新点
+    b_o = tl.zeros([C, BV], dtype=tl.float32)  # BV 列，最后 store 时用 (o_v < V) mask
+
     start_t = initial_t + i_n * C
     rem = start_t % T_cycle
     j = (T_cycle - rem) if rem != 0 else 0
@@ -504,54 +571,9 @@ def fused_chunk_kda_parallel_output_kernel(
 
     last_update_j = -1
 
-    # 4. 跨越式分段执行 (替换掉原来的 for j in range(C))
     while j < C:
-        # ==== 阶段 A：计算 Segment (last_update_j, j] 的 O ====
-        mask_seg = (o_c > last_update_j) & (o_c <= j)
-        
-        q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
-        k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
-        v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
-        a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
-        b_seg = tl.where(mask_seg, b_beta_tilde, 0.0)
+        mask_seg = (o_c > last_update_j) & (o_c <= j) & mask_t
 
-        aq_seg = a_seg * q_seg
-        ak_seg = a_seg * k_seg
-        dot_qk = tl.sum(q_seg * k_seg, axis=1) # [C]
-        c_seg_val = b_seg * dot_qk
-        
-        p_aqk = Aqk + (i_b * N * C * H + (i_n * C + o_c) * H + i_h)
-        tl.store(p_aqk, c_seg_val, mask=mask_seg)
-
-        # 这里的 tl.dot 现在只在这个段落发生时调用一次！
-        term1 = tl.dot(aq_seg, b_S)          
-        S_ak = tl.dot(ak_seg, b_S)
-        b_o += term1 - (c_seg_val[:, None] * S_ak) + (c_seg_val[:, None] * v_seg)
-
-        # ==== 阶段 B：状态跳变更新 ====
-        token_idx = i_n * C + j
-        offset = i_b * (N * C) * H + token_idx * H + i_h
-        
-        u_k = tl.load(k + offset * K + o_k).to(tl.float32)
-        u_v = tl.load(v + offset * V + o_v).to(tl.float32)
-        u_alpha = tl.exp(tl.load(g + offset * K + o_k).to(tl.float32))
-        u_beta = tl.load(beta + offset).to(tl.float32)
-        
-        a_S = u_alpha[:, None] * b_S
-        k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
-        b_k_u = u_beta * u_k
-        
-        b_S = a_S - b_k_u[:, None] * k_a_S[None, :] + b_k_u[:, None] * u_v[None, :]
-
-        last_update_j = j
-        
-        # 飞跃到下一个更新点！
-        j += T_cycle
-
-    # 5. 处理本 Chunk 的尾部段落 (Tail Segment)
-    if last_update_j < C - 1:
-        mask_seg = o_c > last_update_j
-        
         q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
         k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
         v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
@@ -562,18 +584,54 @@ def fused_chunk_kda_parallel_output_kernel(
         ak_seg = a_seg * k_seg
         dot_qk = tl.sum(q_seg * k_seg, axis=1)
         c_seg_val = b_seg * dot_qk
-        
-        p_aqk = Aqk + (i_b * N * C * H + (i_n * C + o_c) * H + i_h)
+
+        p_aqk = Aqk + (base_bth + t * H + i_h)
         tl.store(p_aqk, c_seg_val, mask=mask_seg)
 
         term1 = tl.dot(aq_seg, b_S)
         S_ak = tl.dot(ak_seg, b_S)
         b_o += term1 - (c_seg_val[:, None] * S_ak) + (c_seg_val[:, None] * v_seg)
 
-    # 6. 统一写回全局显存
-    p_o = o + (i_b * N * C * H + (i_n * C + o_c)[:, None] * H + i_h) * V + o_v[None, :]
-    tl.store(p_o, b_o.to(o.dtype.element_ty))
-    
-    
-    
-    
+        # ==== 状态跳变更新 ====
+        token_idx = i_n * C + j
+        mask_u_t = token_idx < T
+
+        offset = base_bth + token_idx * H + i_h
+
+        u_k = tl.load(k + offset * K + o_k, mask=(o_k < K) & mask_u_t, other=0.0).to(tl.float32)
+        u_v = tl.load(v + offset * V + o_v, mask=(o_v < V) & mask_u_t, other=0.0).to(tl.float32)
+        u_alpha = tl.exp(tl.load(g + offset * K + o_k, mask=(o_k < K) & mask_u_t, other=-float("inf")).to(tl.float32))
+        u_beta = tl.load(beta + offset, mask=mask_u_t, other=0.0).to(tl.float32)
+
+        a_S = u_alpha[:, None] * b_S
+        k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
+        b_k_u = u_beta * u_k
+
+        b_S = a_S - b_k_u[:, None] * k_a_S[None, :] + b_k_u[:, None] * u_v[None, :]
+
+        last_update_j = j
+        j += T_cycle
+
+    if last_update_j < C - 1:
+        mask_seg = (o_c > last_update_j) & mask_t
+
+        q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
+        k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
+        v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
+        a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
+        b_seg = tl.where(mask_seg, b_beta_tilde, 0.0)
+
+        aq_seg = a_seg * q_seg
+        ak_seg = a_seg * k_seg
+        dot_qk = tl.sum(q_seg * k_seg, axis=1)
+        c_seg_val = b_seg * dot_qk
+
+        p_aqk = Aqk + (base_bth + t * H + i_h)
+        tl.store(p_aqk, c_seg_val, mask=mask_seg)
+
+        term1 = tl.dot(aq_seg, b_S)
+        S_ak = tl.dot(ak_seg, b_S)
+        b_o += term1 - (c_seg_val[:, None] * S_ak) + (c_seg_val[:, None] * v_seg)
+
+    p_o = o + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
+    tl.store(p_o, b_o.to(o.dtype.element_ty), mask=mask_t[:, None] & (o_v < V)[None, :])
