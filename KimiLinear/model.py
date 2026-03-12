@@ -164,14 +164,16 @@ class KimiLinearTimeModel(KimiPreTrainedModel):
             config.hidden_size, eps=config.rms_norm_eps)
         self.output_proj = nn.Linear(config.hidden_size, config.input_size)
 
-        if getattr(config, "_attn_implementation", None) is not None:
-            if config._attn_implementation != "flash_attention_2":
-                logger.warning_once(
-                    f"Ignoring the provided attention implementation {config._attn_implementation}")
-                logger.warning_once("Using flash_attention_2 backend instead.")
-                config._attn_implementation = "flash_attention_2"
-        else:
-            config._attn_implementation = "flash_attention_2"
+        # if getattr(config, "_attn_implementation", None) is not None:
+        #     if config._attn_implementation != "flash_attention_2":
+        #         logger.warning_once(
+        #             f"Ignoring the provided attention implementation {config._attn_implementation}")
+        #         logger.warning_once("Using flash_attention_2 backend instead.")
+        #         config._attn_implementation = "flash_attention_2"
+        # else:
+        #     config._attn_implementation = "flash_attention_2"
+            
+        config._attn_implementation = "eager"
 
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.gradient_checkpointing = False

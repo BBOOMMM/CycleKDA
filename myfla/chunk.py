@@ -5,7 +5,6 @@ import triton.language as tl
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
 
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
-# from fla.ops.gla.chunk import chunk_gla_fwd_o_gk
 from myfla.chunk_fwd import chunk_gla_fwd_o_gk
 from fla.ops.kda.chunk_bwd import chunk_kda_bwd_dAv
 from myfla.chunk_bwd import chunk_kda_bwd_wy_dqkg_fused
@@ -37,7 +36,7 @@ def chunk_kda(
     initial_t: int = 0,
     T_cycle: int = 8,
     chunk_indices: torch.LongTensor | None = None,
-    use_triton: bool = False,
+    use_triton: bool = True,
     **kwargs,
 ):
     if cu_seqlens is not None:
@@ -236,7 +235,6 @@ class ChunkKDAFunction_pytorch(torch.nn.Module):
         if output_final_state:
             return o, S
         return o, None
-# ...existing code...
 
 
 class ChunkKDAFunction(torch.autograd.Function):
@@ -279,7 +277,7 @@ class ChunkKDAFunction(torch.autograd.Function):
         chunk_size = 64
         
         
-        o, Aqk, final_state = chunk_kda_fwd(
+        o, Aqk, final_state, chunk_states, intra_states = chunk_kda_fwd(
             q=q,
             k=k,
             v=v,
@@ -295,31 +293,82 @@ class ChunkKDAFunction(torch.autograd.Function):
         )
         
         
-        # if use_gate_in_kernel:
-        #     g = None
+        if use_gate_in_kernel:
+            g = None
         
         
-        # ctx.save_for_backward(
-        #     q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, initial_state, cu_seqlens, chunk_indices
-        # )
-        # ctx.chunk_size = chunk_size
-        # ctx.scale = scale
-        # ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        # ctx.use_gate_in_kernel = use_gate_in_kernel
-        # ctx.initial_t = initial_t     # 新增：用于 bwd
-        # ctx.T_cycle = T_cycle         # 新增：用于 bwd
+        ctx.save_for_backward(
+            q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, Aqk, initial_state, cu_seqlens, chunk_indices, chunk_states, intra_states,
+        )
+        ctx.chunk_size = chunk_size
+        ctx.scale = scale
+        ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        ctx.use_gate_in_kernel = use_gate_in_kernel
+        ctx.initial_t = initial_t     # 新增：用于 bwd
+        ctx.T_cycle = T_cycle         # 新增：用于 bwd
         return o.to(q.dtype), final_state
     
     
     @staticmethod
     @input_guard
     @autocast_custom_bwd
-    def backward(
-        ctx,
-        do: torch.Tensor,
-        dht: torch.Tensor,
-    ):
-        raise NotImplementedError("The backward function is not implemented yet. Please use the PyTorch version for now.")
+    def backward(ctx, do: torch.Tensor, dht: torch.Tensor = None):
+        (q, q_rstd, k, k_rstd, v, g, g_org, beta, A_log, dt_bias, 
+         Aqk, initial_state, cu_seqlens, chunk_indices, chunk_states, intra_states, 
+        ) = ctx.saved_tensors
+        
+        if ctx.use_gate_in_kernel:
+            g = kda_gate_fwd(
+                g=g_org,
+                A_log=A_log,
+                dt_bias=dt_bias,
+            )
+            g = chunk_local_cumsum(
+                g=g,
+                chunk_size=ctx.chunk_size,
+                scale=RCP_LN2,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices
+            )
+        
+        dq, dk, dv, dg, dbeta, d_initial_state = chunk_kda_bwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            do,
+            Aqk,
+            initial_state,
+            chunk_states,
+            intra_states,
+            dht,
+            scale=ctx.scale,
+            initial_t=ctx.initial_t,
+            T_cycle=ctx.T_cycle, 
+            chunk_size=ctx.chunk_size
+        )
+        
+        if ctx.use_qk_l2norm_in_kernel:
+            dq = l2norm_bwd(q, q_rstd, dq)
+            dk = l2norm_bwd(k, k_rstd, dk)
+
+        dA_log, ddt_bias = None, None
+        if ctx.use_gate_in_kernel:
+            dg, dA, dbias = kda_gate_bwd(
+                g=g_org,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                dyg=dg,
+            )
+            dA = dA.to(A_log)
+            if dt_bias is not None:
+                dbias = dbias.to(dt_bias)
+
+        return (
+            dq, dk, dv, dg, dbeta, dA_log, ddt_bias, None, None,
+            None, None, None, None, None, None, None
+        )
     
     
 
@@ -343,11 +392,13 @@ def chunk_kda_fwd(
     V = v.shape[-1]
     C = chunk_size
     N = (T + C - 1) // C
+    M = C // T_cycle + 1  # 每个 chunk 内最多的状态跳变次数
 
     o = torch.empty_like(v)
     Aqk = torch.empty((B, T, H), device=q.device, dtype=torch.float32)
     
     chunk_states = torch.empty((B, H, N, K, V), device=q.device, dtype=torch.float32)
+    intra_states = torch.empty((B, H, N, M, K, V), device=q.device, dtype=torch.float32)
     
     final_state = None
     if output_final_state:
@@ -390,6 +441,7 @@ def chunk_kda_fwd(
         chunk_states,
         o,
         Aqk,
+        intra_states,
         scale,
         initial_t,
         T_cycle,
@@ -402,9 +454,10 @@ def chunk_kda_fwd(
         V,
         BK,
         BV,
+        M,
     )
 
-    return o, Aqk, final_state
+    return o, Aqk, final_state, chunk_states, intra_states
 
 
 
@@ -511,6 +564,7 @@ def chunk_kda_fwd_output_kernel(
     chunk_states,
     o,
     Aqk,
+    intra_states,
     scale,
     initial_t,
     T_cycle: tl.constexpr,
@@ -523,6 +577,7 @@ def chunk_kda_fwd_output_kernel(
     V: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    M: tl.constexpr,
 ):
     i_n = tl.program_id(0)
     i_bh = tl.program_id(1)
@@ -570,6 +625,7 @@ def chunk_kda_fwd_output_kernel(
         j += T_cycle
 
     last_update_j = -1
+    step = 0
 
     while j < C:
         mask_seg = (o_c > last_update_j) & (o_c <= j) & mask_t
@@ -608,9 +664,13 @@ def chunk_kda_fwd_output_kernel(
         b_k_u = u_beta * u_k
 
         b_S = a_S - b_k_u[:, None] * k_a_S[None, :] + b_k_u[:, None] * u_v[None, :]
+        
+        p_intra = intra_states + (i_bh * N + i_n) * M * K * V + step * K * V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_intra, b_S, mask=(o_k < K)[:, None] & (o_v < V)[None, :])
 
         last_update_j = j
         j += T_cycle
+        step += 1
 
     if last_update_j < C - 1:
         mask_seg = (o_c > last_update_j) & mask_t
@@ -635,3 +695,339 @@ def chunk_kda_fwd_output_kernel(
 
     p_o = o + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
     tl.store(p_o, b_o.to(o.dtype.element_ty), mask=mask_t[:, None] & (o_v < V)[None, :])
+    
+    
+
+def chunk_kda_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    do: torch.Tensor,
+    Aqk: torch.Tensor,
+    initial_state: torch.Tensor,
+    chunk_states: torch.Tensor,
+    intra_states: torch.Tensor,
+    dht: torch.Tensor | None,
+    scale: float,
+    initial_t: int,
+    T_cycle: int,
+    chunk_size: int,
+):
+    B, T, H, K = q.shape
+    V = v.shape[-1]
+    C = chunk_size
+    N = (T + C - 1) // C
+    M = C // T_cycle + 1  # 依然保持理论最大跳变次数上界
+
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    dg = torch.empty_like(g)
+    dbeta = torch.empty_like(beta)
+    has_init = initial_state is not None
+    d_initial_state = torch.empty((B, H, K, V), device=q.device, dtype=torch.float32) if initial_state is not None else None
+    d_initial_state_ptr = d_initial_state if has_init else torch.empty((1,), device=q.device, dtype=torch.float32)
+
+    BK = triton.next_power_of_2(K)
+    BV = triton.next_power_of_2(V)
+
+    grid = (B * H, )
+    chunk_kda_bwd_kernel[grid](
+        q,
+        k,
+        v,
+        g,
+        beta,
+        do,
+        Aqk,
+        chunk_states,
+        intra_states,
+        dq,
+        dk,
+        dv,
+        dg,
+        dbeta,
+        dht,
+        d_initial_state_ptr,
+        scale,
+        initial_t,
+        T_cycle,
+        N,
+        C,
+        B,
+        T,
+        H,
+        K,
+        V,
+        BK,
+        BV,
+        M,
+        LOAD_FINAL_STATE=(dht is not None),
+        HAS_INITIAL_STATE=has_init,
+    )
+    return dq, dk, dv, dg, dbeta, d_initial_state
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [2, 4, 8]
+        for num_stages in[1, 2, 3, 4]
+    ],
+    key=['H', 'K', 'V', 'C'],
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
+)
+@triton.jit
+def chunk_kda_bwd_kernel(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    do,
+    Aqk,
+    chunk_states,
+    intra_states,
+    dq,
+    dk,
+    dv,
+    dg,
+    dbeta,
+    dht,
+    d_initial_state,
+    scale,
+    initial_t, 
+    T_cycle: tl.constexpr,
+    N: tl.constexpr,
+    C: tl.constexpr,
+    B: tl.constexpr, 
+    T: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    M: tl.constexpr,
+    LOAD_FINAL_STATE: tl.constexpr,
+    HAS_INITIAL_STATE: tl.constexpr,
+):
+    i_bh = tl.program_id(0)
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    o_k = tl.arange(0, BK)
+    o_v = tl.arange(0, BV)
+    o_c = tl.arange(0, C)
+
+    d_b_S = tl.zeros([BK, BV], dtype=tl.float32)
+    if LOAD_FINAL_STATE:
+        p_dht = dht + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
+        d_b_S = tl.load(p_dht, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+
+    # 从最后一块 chunk 倒序计算
+    for i_n in range(N - 1, -1, -1):
+        t = i_n * C + o_c
+        mask_t = t < T
+        base_bth = i_b * T * H
+        
+        # === 批量 Load 这一个 Chunk 内部所有的前向激活与梯度 ===
+        p_q = q + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
+        p_k = k + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
+        p_v = v + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
+        p_g = g + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
+        p_b = beta + (base_bth + t * H + i_h)
+        p_do = do + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
+        p_Aqk = Aqk + (base_bth + t * H + i_h)
+
+        b_q = tl.load(p_q, mask=mask_t[:, None] & (o_k < K)[None, :], other=0.0).to(tl.float32) * scale
+        b_k = tl.load(p_k, mask=mask_t[:, None] & (o_k < K)[None, :], other=0.0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_t[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+        b_g = tl.load(p_g, mask=mask_t[:, None] & (o_k < K)[None, :], other=-float("inf")).to(tl.float32)
+        b_beta = tl.load(p_b, mask=mask_t, other=0.0).to(tl.float32)
+        b_do = tl.load(p_do, mask=mask_t[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+        b_Aqk = tl.load(p_Aqk, mask=mask_t, other=0.0).to(tl.float32)
+
+        b_alpha = tl.exp(b_g)
+        cur_t_global = initial_t + i_n * C + o_c
+        mod_t = cur_t_global % T_cycle
+        rho = tl.where(mod_t == 0, 1.0, mod_t.to(tl.float32) / T_cycle)
+        b_beta_tilde = b_beta * rho
+
+        b_dq = tl.zeros([C, BK], dtype=tl.float32)
+        b_dk = tl.zeros([C, BK], dtype=tl.float32)
+        b_dv = tl.zeros([C, BV], dtype=tl.float32)
+        b_dg = tl.zeros([C, BK], dtype=tl.float32)
+        b_dbeta = tl.zeros([C], dtype=tl.float32)
+
+        # === 预计算跳变位置与次数 ===
+        start_t = initial_t + i_n * C
+        rem = start_t % T_cycle
+        first_j = (T_cycle - rem) if rem != 0 else 0
+        if start_t == 0 and first_j == 0:
+            first_j += T_cycle
+            
+        num_updates = 0
+        j = first_j
+        last_update_j = -1
+        while j < C:
+            last_update_j = j
+            num_updates += 1
+            j += T_cycle
+
+        # 从该 Chunk 内部最末尾的一个状态开始往前溯
+        step = num_updates
+
+        # === 处理尾部不完整的 Segment（如果在最后一次跳变之后还有 tokens）===
+        if last_update_j < C - 1:
+            # 动态判断去哪取状态：如果没有过跳变（step=0），用原始块状态；否则用 intra_states
+            if step == 0:
+                p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
+                b_S = tl.load(p_cs, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+            else:
+                p_intra = intra_states + (i_bh * N + i_n) * M * K * V + (step - 1) * K * V + o_k[:, None] * V + o_v[None, :]
+                b_S = tl.load(p_intra, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+
+            mask_seg = (o_c > last_update_j) & mask_t
+
+            q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
+            k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
+            v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
+            a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
+            b_seg = tl.where(mask_seg, b_beta_tilde, 0.0)
+            do_seg = tl.where(mask_seg[:, None], b_do, 0.0)
+            c_seg_val = tl.where(mask_seg, b_Aqk, 0.0)
+
+            aq_seg = a_seg * q_seg
+            ak_seg = a_seg * k_seg
+            S_ak = tl.dot(ak_seg, b_S)
+
+            d_c_seg_val = tl.sum(do_seg * (v_seg - S_ak), axis=1)
+            d_S_ak = -c_seg_val[:, None] * do_seg
+
+            d_aq_seg = tl.dot(do_seg, tl.trans(b_S))
+            d_b_S_1 = tl.dot(tl.trans(aq_seg), do_seg)
+            d_ak_seg = tl.dot(d_S_ak, tl.trans(b_S))
+            d_b_S_2 = tl.dot(tl.trans(ak_seg), d_S_ak)
+            
+            d_dot_qk = d_c_seg_val * b_seg
+
+            b_dq += (d_dot_qk[:, None] * k_seg + d_aq_seg * a_seg) * scale
+            b_dk += (d_dot_qk[:, None] * q_seg + d_ak_seg * a_seg)
+            b_dv += c_seg_val[:, None] * do_seg
+            b_dg += (d_aq_seg * q_seg + d_ak_seg * k_seg) * a_seg
+            b_dbeta += d_c_seg_val * tl.sum(q_seg * k_seg, axis=1) * rho
+
+            d_b_S += d_b_S_1 + d_b_S_2
+
+        # === 依次倒序处理所有的 State Jump 和 Jump 前的 Segment ===
+        j = last_update_j
+        step = num_updates - 1
+        
+        while step >= 0:
+            prev_j = j - T_cycle
+            if step == 0:
+                prev_j = -1
+            
+            # 加载 Jump `j` 发生前的状态 b_S
+            if step == 0:
+                p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
+                b_S = tl.load(p_cs, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+            else:
+                p_intra = intra_states + (i_bh * N + i_n) * M * K * V + (step - 1) * K * V + o_k[:, None] * V + o_v[None, :]
+                b_S = tl.load(p_intra, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+
+            mask_j = (o_c == j) & mask_t
+            token_idx = i_n * C + j
+
+            # 反向传播 State Update 逻辑 (发生在 t=token_idx 处)
+            if token_idx < T:
+                offset = base_bth + token_idx * H + i_h
+                u_k = tl.load(k + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32)
+                u_v = tl.load(v + offset * V + o_v, mask=(o_v < V), other=0.0).to(tl.float32)
+                u_alpha = tl.exp(tl.load(g + offset * K + o_k, mask=(o_k < K), other=-float("inf")).to(tl.float32))
+                u_beta = tl.load(beta + offset).to(tl.float32)
+
+                a_S = u_alpha[:, None] * b_S
+                k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
+                b_k_u = u_beta * u_k
+
+                # 通过链式法则求梯度，向过去推导 d_b_S
+                d_a_S = d_b_S + 0.0
+                d_b_k_u = tl.sum(d_b_S * (u_v[None, :] - k_a_S[None, :]), axis=1)
+                d_k_a_S = tl.sum(d_b_S * (-b_k_u[:, None]), axis=0)
+                d_u_v = tl.sum(d_b_S * b_k_u[:, None], axis=0)
+
+                d_u_k_1 = tl.sum(d_k_a_S[None, :] * a_S, axis=1)
+                d_a_S += d_k_a_S[None, :] * u_k[:, None]
+
+                d_u_beta = tl.sum(d_b_k_u * u_k)
+                d_u_k_2 = d_b_k_u * u_beta
+
+                d_u_alpha = tl.sum(d_a_S * b_S, axis=1)
+                d_b_S = d_a_S * u_alpha[:, None]  # 用新算出的梯度覆盖 d_b_S 继续向前传
+
+                d_u_k = d_u_k_1 + d_u_k_2
+                d_u_g = d_u_alpha * u_alpha
+                
+                b_dk += tl.where(mask_j[:, None], d_u_k[None, :], 0.0)
+                b_dv += tl.where(mask_j[:, None], d_u_v[None, :], 0.0)
+                b_dg += tl.where(mask_j[:, None], d_u_g[None, :], 0.0)
+                b_dbeta += tl.where(mask_j, d_u_beta, 0.0)
+
+            # 反向传播 Jump 前的 Segment (范围: prev_j < t <= j)
+            mask_seg = (o_c > prev_j) & (o_c <= j) & mask_t
+
+            q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
+            k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
+            v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
+            a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
+            b_seg = tl.where(mask_seg, b_beta_tilde, 0.0)
+            do_seg = tl.where(mask_seg[:, None], b_do, 0.0)
+            c_seg_val = tl.where(mask_seg, b_Aqk, 0.0)
+
+            aq_seg = a_seg * q_seg
+            ak_seg = a_seg * k_seg
+            S_ak = tl.dot(ak_seg, b_S)
+
+            d_c_seg_val = tl.sum(do_seg * (v_seg - S_ak), axis=1)
+            d_S_ak = -c_seg_val[:, None] * do_seg
+
+            d_aq_seg = tl.dot(do_seg, tl.trans(b_S))
+            d_b_S_1 = tl.dot(tl.trans(aq_seg), do_seg)
+            d_ak_seg = tl.dot(d_S_ak, tl.trans(b_S))
+            d_b_S_2 = tl.dot(tl.trans(ak_seg), d_S_ak)
+            
+            d_dot_qk = d_c_seg_val * b_seg
+
+            b_dq += (d_dot_qk[:, None] * k_seg + d_aq_seg * a_seg) * scale
+            b_dk += (d_dot_qk[:, None] * q_seg + d_ak_seg * a_seg)
+            b_dv += c_seg_val[:, None] * do_seg
+            b_dg += (d_aq_seg * q_seg + d_ak_seg * k_seg) * a_seg
+            b_dbeta += d_c_seg_val * tl.sum(q_seg * k_seg, axis=1) * rho
+            
+            # 此处的梯度再叠加到全局 d_b_S 上，然后倒退下一个环节
+            d_b_S += d_b_S_1 + d_b_S_2
+
+            j -= T_cycle
+            step -= 1
+
+        # === 写入当前 Chunk 的所有梯度 ===
+        p_dq = dq + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
+        p_dk = dk + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
+        p_dv = dv + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
+        p_dg = dg + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
+        p_dbeta = dbeta + (base_bth + t * H + i_h)
+        
+        tl.store(p_dq, b_dq, mask=mask_t[:, None] & (o_k < K)[None, :])
+        tl.store(p_dk, b_dk, mask=mask_t[:, None] & (o_k < K)[None, :])
+        tl.store(p_dv, b_dv, mask=mask_t[:, None] & (o_v < V)[None, :])
+        tl.store(p_dg, b_dg, mask=mask_t[:, None] & (o_k < K)[None, :])
+        tl.store(p_dbeta, b_dbeta, mask=mask_t)
+
+    # N 个 chunk 全部处理完，此时的 d_b_S 即是传回初始状态 (initial_state) 的梯度
+    if HAS_INITIAL_STATE:
+        p_d_init = d_initial_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_d_init, d_b_S, mask=(o_k < K)[:, None] & (o_v < V)[None, :])

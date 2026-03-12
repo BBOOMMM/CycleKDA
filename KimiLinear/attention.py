@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
 from collections.abc import Callable
 
@@ -179,38 +180,6 @@ class KimiDeltaAttention(nn.Module):
                 initial_t=past_len,
                 T_cycle=self.T_cycle,
             )
-        
-        past_len = 0
-        o1, recurrent_state1 = chunk_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-                initial_t=past_len,
-                T_cycle=self.T_cycle,
-            )
-        o2, recurrent_state2 = fused_recurrent_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-                initial_t=past_len,
-                T_cycle=self.T_cycle,
-            )
-        
-        diff = (o1 - o2).abs()
-        print(f"\nMax diff: {diff.max().item():.6f}")
-        print(f"Mean diff: {diff.mean().item():.6f}")
         
         
         if cache_params is not None:

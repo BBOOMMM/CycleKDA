@@ -20,8 +20,8 @@ dist-packages/*
 exp
 results
 wandb
-*.csv
-*.png
+# *.csv
+# *.png
 *.html
 
 # log and config files
