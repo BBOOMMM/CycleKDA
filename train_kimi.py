@@ -162,60 +162,9 @@ def train():
     with open(os.path.join(save_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config.to_dict(), f, ensure_ascii=False, indent=2)
 
-            
-
-
+        
 
 if __name__ == "__main__":
     train()
 
-
-
-
-
-
-
-
-
-
-
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# cfg_path = os.path.join(os.path.dirname(__file__), "kimi_config.json")
-# with open(cfg_path, "r", encoding="utf-8") as f:
-#     cfg_json = json.load(f)
-
-# config = KimiLinearConfig(**cfg_json)
-
-# attn = KimiDeltaAttention(config, 0).to(device)
-# attn.train()  # 开启训练模式
-
-# batch_size = 2
-# seq_len = 128
-# hidden_states = torch.randn(batch_size, seq_len, config.hidden_size, device=device, dtype=torch.float32)
-
-# attention_mask = None
-
-# cache = KimiDynamicCache(config)
-
-# optimizer = torch.optim.AdamW(attn.parameters(), lr=1e-4)
-
-# out = attn(hidden_states, attention_mask=attention_mask, cache_params=cache)
-
-# if isinstance(out, tuple):
-#     o = out[0]
-# else:
-#     o = out
-
-# loss = o.float().pow(2).mean()
-
-# optimizer.zero_grad(set_to_none=True)
-# loss.backward()
-
-# torch.nn.utils.clip_grad_norm_(attn.parameters(), max_norm=1.0)
-
-# optimizer.step()
-
-# print("loss =", float(loss.detach().cpu()))
-# print("o.shape =", tuple(o.shape))
 

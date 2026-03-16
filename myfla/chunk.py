@@ -3,15 +3,7 @@ import triton
 import triton.language as tl
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
-
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
-from myfla.chunk_fwd import chunk_gla_fwd_o_gk
-from fla.ops.kda.chunk_bwd import chunk_kda_bwd_dAv
-from myfla.chunk_bwd import chunk_kda_bwd_wy_dqkg_fused
-from fla.ops.kda.chunk_intra import chunk_kda_bwd_intra, chunk_kda_fwd_intra
 from fla.ops.kda.gate import kda_gate_bwd, kda_gate_fwd
-from fla.ops.kda.wy_fast import recompute_w_u_fwd
-
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
@@ -726,9 +718,9 @@ def chunk_kda_bwd(
     dv = torch.empty_like(v)
     dg = torch.empty_like(g)
     dbeta = torch.empty_like(beta)
-    has_init = initial_state is not None
+    # has_init = initial_state is not None
     d_initial_state = torch.empty((B, H, K, V), device=q.device, dtype=torch.float32) if initial_state is not None else None
-    d_initial_state_ptr = d_initial_state if has_init else torch.empty((1,), device=q.device, dtype=torch.float32)
+    # d_initial_state_ptr = d_initial_state if has_init else torch.empty((1,), device=q.device, dtype=torch.float32)
 
     BK = triton.next_power_of_2(K)
     BV = triton.next_power_of_2(V)
@@ -750,7 +742,7 @@ def chunk_kda_bwd(
         dg,
         dbeta,
         dht,
-        d_initial_state_ptr,
+        d_initial_state,
         scale,
         initial_t,
         T_cycle,
@@ -765,7 +757,7 @@ def chunk_kda_bwd(
         BV,
         M,
         LOAD_FINAL_STATE=(dht is not None),
-        HAS_INITIAL_STATE=has_init,
+        HAS_INITIAL_STATE=(initial_state is not None),
     )
     return dq, dk, dv, dg, dbeta, d_initial_state
 
@@ -782,7 +774,7 @@ def chunk_kda_bwd(
 )
 @triton.jit
 def chunk_kda_bwd_kernel(
-    q,
+    q,   # [B, T, H, K]
     k,
     v,
     g,
