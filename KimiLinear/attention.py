@@ -63,13 +63,13 @@ class KimiDeltaAttention(nn.Module):
         )
 
         self.A_log = torch.nn.Parameter(torch.log(torch.empty(
-            self.num_heads, dtype=torch.float32).uniform_(1, 16)).view(1, 1, -1, 1))
+            self.num_heads, dtype=torch.float32).uniform_(1, 16)).view(1, 1, -1, 1))   # [1, 1, num_heads, 1]  A_log 可学习的参数，初始化为 log(uniform(1, 16))，A 的初始值在 [1, 16] 之间均匀分布
 
         self.f_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
         self.f_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
 
         self.dt_bias = nn.Parameter(
-            torch.empty(projection_size, dtype=torch.float32))
+            torch.empty(projection_size, dtype=torch.float32))   # dt_bias 可学习的参数，shape 为 [projection_size(hidden_size)]，在 gate 中作为 softplus 的输入的一部分，影响门控的强度和稀疏性
 
         self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
 
@@ -108,7 +108,7 @@ class KimiDeltaAttention(nn.Module):
         cu_seqlens = kwargs.get('cu_seqlens')
         indices = None
         if attention_mask is not None:
-            if not self.var_len:
+            if not self.var_len:  # 是否支持变长训练
                 indices, cu_seqlens = None, None
                 hidden_states = hidden_states * attention_mask.unsqueeze(-1).to(hidden_states.dtype)
             else:
@@ -143,7 +143,7 @@ class KimiDeltaAttention(nn.Module):
         )
         g = self.f_b_proj(self.f_a_proj(hidden_states))
         g = rearrange(g, '... (h d) -> ... h d', d=self.head_dim)
-        g = fused_kda_gate(g, self.A_log, dt_bias=self.dt_bias)   # g = − A ⊙ softplus(g_raw + dt)   softplus(x) = ln(1 + exp(x))    exp(g) 是实际的门控
+        g = fused_kda_gate(g, self.A_log, dt_bias=self.dt_bias)   # g = − A ⊙ softplus(g_raw + dt) < 0   softplus(x) = ln(1 + exp(x))    exp(g) 是实际的门控
         beta = self.b_proj(hidden_states).float().sigmoid()
 
         q, k = map(lambda x: rearrange(
@@ -358,3 +358,41 @@ class KimiMLAAttention(nn.Module):
             batch_size, seq_length, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output
+    
+
+
+@tensor_cache
+def get_unpad_data(
+    attention_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    lens = prepare_lens_from_mask(attention_mask)
+    indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = lens.max().item()
+    cu_seqlens = prepare_cu_seqlens_from_mask(attention_mask)
+    return indices, cu_seqlens, max_seqlen_in_batch
+
+
+def index_first_axis(x, indices):
+    other_shape = x.shape[1:]
+    second_dim = other_shape.numel()
+    return torch.gather(
+        rearrange(x, "b ... -> b (...)"), 0, repeat(indices, "z -> z d", d=second_dim),
+    ).reshape(-1, *other_shape)
+    
+
+def pad_input(
+    hidden_states: torch.Tensor,
+    indices: torch.LongTensor,
+    batch_size: int,
+    seq_len: int,
+) -> torch.Tensor:
+    output = index_put_first_axis(hidden_states, indices, batch_size * seq_len)
+    return rearrange(output, "(b s) ... -> b s ...", b=batch_size)
+
+
+def index_put_first_axis(x, indices, first_axis_dim):
+    y = torch.zeros(first_axis_dim, *x.shape[1:], device=x.device, dtype=x.dtype)
+    # TODO [2022-03-04] For some reason torch.scatter is a bit faster than indexing.
+    y[indices] = x
+    # y.scatter_(0, repeat(indices, 'z -> z d', d=x.shape[1]), x)
+    return y

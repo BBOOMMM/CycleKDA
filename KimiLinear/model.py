@@ -172,7 +172,6 @@ class KimiLinearTimeModel(KimiPreTrainedModel):
         #         config._attn_implementation = "flash_attention_2"
         # else:
         #     config._attn_implementation = "flash_attention_2"
-            
         config._attn_implementation = "eager"
 
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
@@ -215,7 +214,7 @@ class KimiLinearTimeModel(KimiPreTrainedModel):
             inputs_embeds = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = KimiDynamicCache(config=self.config)
+            past_key_values = KimiDynamicCache(config=self.config)   # initialize cache
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length(
@@ -234,7 +233,7 @@ class KimiLinearTimeModel(KimiPreTrainedModel):
             cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
-        )
+        )  # 对角线及下三角为0，上三角为-inf    shape: [batch_size, 1, seq_len, seq_len]
         linear_attn_mask = self._update_linear_attn_mask(
             attention_mask, cache_position)
 
