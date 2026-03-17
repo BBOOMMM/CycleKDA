@@ -1,6 +1,8 @@
 import torch
 
-from myfla import chunk_kda, fused_recurrent_kda
+# from myfla import chunk_kda, fused_recurrent_kda
+from myfla.chunk_vecbeta import chunk_kda
+from myfla.fuesd_recurrent_vecbeta import fused_recurrent_kda
 
 
 def test_chunk_kda():
@@ -12,7 +14,8 @@ def test_chunk_kda():
     v = torch.randn(B, T, H, V).cuda()
     g = torch.randn(B, T, H, K).cuda()
     g = g - 2*g.max()
-    beta = torch.rand(B, T, H).sigmoid().cuda()
+    # beta = torch.rand(B, T, H).sigmoid().cuda()
+    beta = torch.rand(B, T, H, K).float().sigmoid().cuda()
     
     print("Testing Parallel...")
     o_parallel, recurrent_state = chunk_kda(
@@ -27,6 +30,7 @@ def test_chunk_kda():
                             cu_seqlens=None,
                             initial_t=0,
                             T_cycle=8,
+                            use_triton=False,
                         )
     print(f"Parallel output shape: {o_parallel.shape}")
     print(f"Parallel output mean: {o_parallel.mean().item():.6f}")

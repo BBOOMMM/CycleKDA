@@ -6,7 +6,9 @@ from collections.abc import Callable
 
 from fla.modules import FusedRMSNormGated, ShortConvolution
 # from fla.ops.kda import chunk_kda, fused_recurrent_kda
-from myfla import chunk_kda, fused_recurrent_kda
+# from myfla import chunk_kda, fused_recurrent_kda
+from myfla.chunk_vecbeta import chunk_kda
+from myfla.fuesd_recurrent_vecbeta import fused_recurrent_kda
 from fla.ops.kda.gate import fused_kda_gate
 from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask
 from fla.utils import tensor_cache
@@ -71,7 +73,8 @@ class KimiDeltaAttention(nn.Module):
         self.dt_bias = nn.Parameter(
             torch.empty(projection_size, dtype=torch.float32))   # dt_bias 可学习的参数，shape 为 [projection_size(hidden_size)]，在 gate 中作为 softplus 的输入的一部分，影响门控的强度和稀疏性
 
-        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+        # self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+        self.b_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
 
         self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
         self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
@@ -145,12 +148,13 @@ class KimiDeltaAttention(nn.Module):
         g = rearrange(g, '... (h d) -> ... h d', d=self.head_dim)
         g = fused_kda_gate(g, self.A_log, dt_bias=self.dt_bias)   # g = − A ⊙ softplus(g_raw + dt) < 0   softplus(x) = ln(1 + exp(x))    exp(g) 是实际的门控
         beta = self.b_proj(hidden_states).float().sigmoid()
+        beta = rearrange(beta, '... (h d) -> ... h d', d=self.head_dim)
 
         q, k = map(lambda x: rearrange(
             x, '... (h d) -> ... h d', d=self.head_k_dim), (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
 
-        if mode == 'chunk':   # 训练，或者推理第一步
+        if mode == 'chunk':
             past_len = 0      # 训练，或者推理第一步  past_len 都是 0
             o, recurrent_state = chunk_kda(
                 q=q,
