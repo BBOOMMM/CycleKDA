@@ -8,17 +8,17 @@ from myfla.fuesd_recurrent_vecbeta import fused_recurrent_kda
 def test_chunk_kda():
     torch.manual_seed(42)
     
-    B, T, H, K, V = 2, 128, 4, 64, 64
+    B, T, H, K, V = 2, 120, 4, 64, 64
     q = torch.randn(B, T, H, K).cuda()
     k = torch.randn(B, T, H, K).cuda()
     v = torch.randn(B, T, H, V).cuda()
     g = torch.randn(B, T, H, K).cuda()
-    g = g - 2*g.max()
+    g = g - g.max()
     # beta = torch.rand(B, T, H).sigmoid().cuda()
     beta = torch.rand(B, T, H, K).float().sigmoid().cuda()
     
     print("Testing Parallel...")
-    o_parallel, recurrent_state = chunk_kda(
+    o_parallel, state_parallel = chunk_kda(
                             q=q,
                             k=k,
                             v=v,
@@ -36,7 +36,7 @@ def test_chunk_kda():
     print(f"Parallel output mean: {o_parallel.mean().item():.6f}")
     
     print("\nTesting Recurrent...")
-    o_recurrent, recurrent_state = fused_recurrent_kda(
+    o_recurrent, state_recurrent = fused_recurrent_kda(
                                             q=q,
                                             k=k,
                                             v=v,
@@ -55,6 +55,10 @@ def test_chunk_kda():
     diff = (o_recurrent - o_parallel).abs()
     print(f"\nMax diff: {diff.max().item():.6f}")
     print(f"Mean diff: {diff.mean().item():.6f}")
+    
+    state_diff = (state_parallel - state_recurrent).abs()
+    print(f"\nState Max diff: {state_diff.max().item():.6f}")
+    print(f"State Mean diff: {state_diff.mean().item():.6f}")
     
     for i in range(T):
         step_diff = (o_recurrent[:, i] - o_parallel[:, i]).abs()

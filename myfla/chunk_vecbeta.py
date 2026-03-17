@@ -249,8 +249,8 @@ class ChunkKDAFunction(torch.autograd.Function):
         use_qk_l2norm_in_kernel: bool = False,
         use_gate_in_kernel: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
-        initial_t: int = 0, # 新增
-        T_cycle: int = 8,   # 新增
+        initial_t: int = 0,
+        T_cycle: int = 8,
         chunk_indices: torch.LongTensor | None = None,
     ):
         g_org = None
@@ -263,7 +263,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             )
         
         q_rstd, k_rstd = None, None
-        if use_qk_l2norm_in_kernel:   # 做 RMSNorm 归一化
+        if use_qk_l2norm_in_kernel:
             q, q_rstd = l2norm_fwd(q)
             k, k_rstd = l2norm_fwd(k)
         
@@ -280,8 +280,8 @@ class ChunkKDAFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
-            initial_t=initial_t, # 新增
-            T_cycle=T_cycle,   # 新增
+            initial_t=initial_t,
+            T_cycle=T_cycle,
             chunk_indices=chunk_indices,
         )
         
@@ -297,8 +297,8 @@ class ChunkKDAFunction(torch.autograd.Function):
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
         ctx.use_gate_in_kernel = use_gate_in_kernel
-        ctx.initial_t = initial_t     # 新增：用于 bwd
-        ctx.T_cycle = T_cycle         # 新增：用于 bwd
+        ctx.initial_t = initial_t
+        ctx.T_cycle = T_cycle
         return o.to(q.dtype), final_state
     
     
@@ -376,8 +376,8 @@ def chunk_kda_fwd(
     initial_state: torch.Tensor,
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
-    initial_t: int = 0, # 新增
-    T_cycle: int = 8,   # 新增
+    initial_t: int = 0,
+    T_cycle: int = 8,
     chunk_indices: torch.LongTensor | None = None,
     chunk_size: int = 64,
 ):
@@ -495,9 +495,10 @@ def chunk_kda_fwd_state_kernel(
     o_v = tl.arange(0, BV)
 
     b_S = tl.zeros([BK, BV], dtype=tl.float32)
+    mask_h = (o_k < K)[:, None] & (o_v < V)[None, :]
     if USE_INITIAL_STATE:
         p_h0 = initial_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
-        b_S += tl.load(p_h0, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+        b_S += tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
 
     for i_n in range(N):
         p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
@@ -512,21 +513,22 @@ def chunk_kda_fwd_state_kernel(
         while j < C:
             token_idx = i_n * C + j
 
-            # batch stride 用真实 T
             offset = i_b * T * H + token_idx * H + i_h
 
             p_k = k + offset * K + o_k
             p_v = v + offset * V + o_v
             p_g = g + offset * K + o_k
-            p_b = beta + offset
+            p_b = beta + offset * K + o_k
 
-            mask_tok = token_idx < T  # scalar mask
+            mask_token = token_idx < T
+            mask_k = o_k < K
+            mask_v = o_v < V
 
-            # token 越界时：u_k/u_v/u_beta=0，u_alpha=1（通过 g 的 other=0 达成）
-            u_k = tl.load(p_k, mask=(o_k < K) & mask_tok, other=0.0).to(tl.float32)
-            u_v = tl.load(p_v, mask=(o_v < V) & mask_tok, other=0.0).to(tl.float32)
-            u_alpha = tl.exp(tl.load(p_g, mask=(o_k < K) & mask_tok, other=0.0).to(tl.float32))
-            u_beta = tl.load(p_b, mask=mask_tok, other=0.0).to(tl.float32)
+            # token 越界时：u_k/u_v/u_beta=0，u_alpha=1 (通过 g 的 other=0 达成)
+            u_k = tl.load(p_k, mask=mask_k & mask_token, other=0.0).to(tl.float32)
+            u_v = tl.load(p_v, mask=mask_v & mask_token, other=0.0).to(tl.float32)
+            u_alpha = tl.exp(tl.load(p_g, mask=mask_k & mask_token, other=0).to(tl.float32))
+            u_beta = tl.load(p_b, mask=mask_k & mask_token, other=0.0).to(tl.float32)
 
             a_S = u_alpha[:, None] * b_S
             k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
@@ -537,7 +539,7 @@ def chunk_kda_fwd_state_kernel(
 
     if STORE_FINAL_STATE:
         p_ht = final_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
-        tl.store(p_ht, b_S, mask=(o_k < K)[:, None] & (o_v < V)[None, :])
+        tl.store(p_ht, b_S, mask=mask_h)
         
         
 
@@ -587,29 +589,32 @@ def chunk_kda_fwd_output_kernel(
     t = i_n * C + o_c
     mask_t = t < T
 
-    # batch 内 stride 必须用真实 T
     base_bth = (i_b * T * H)
+    base_tokens = base_bth + t[:, None] * H + i_h
 
-    p_q = q + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
-    p_k = k + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
-    p_v = v + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
-    p_g = g + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
-    p_b = beta + (base_bth + t * H + i_h)
+    p_q = q + base_tokens * K + o_k[None, :]
+    p_k = k + base_tokens * K + o_k[None, :]
+    p_v = v + base_tokens * V + o_v[None, :]
+    p_g = g + base_tokens * K + o_k[None, :]
+    p_b = beta + base_tokens * K + o_k[None, :]
+    
+    mask_tk = mask_t[:, None] & (o_k < K)[None, :]
+    mask_tv = mask_t[:, None] & (o_v < V)[None, :]
 
-    b_q = tl.load(p_q, mask=mask_t[:, None] & (o_k < K)[None, :], other=0.0).to(tl.float32) * scale
-    b_k = tl.load(p_k, mask=mask_t[:, None] & (o_k < K)[None, :], other=0.0).to(tl.float32)
-    b_v = tl.load(p_v, mask=mask_t[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
-    b_g = tl.load(p_g, mask=mask_t[:, None] & (o_k < K)[None, :], other=-float("inf")).to(tl.float32)
-    b_beta = tl.load(p_b, mask=mask_t, other=0.0).to(tl.float32)
+    b_q = tl.load(p_q, mask=mask_tk, other=0.0).to(tl.float32) * scale    # [C,BK]
+    b_k = tl.load(p_k, mask=mask_tk, other=0.0).to(tl.float32)            # [C,BK]
+    b_v = tl.load(p_v, mask=mask_tv, other=0.0).to(tl.float32)            # [C,BV]
+    b_g = tl.load(p_g, mask=mask_tk, other=-float("inf")).to(tl.float32)  # [C,BK]
+    b_beta = tl.load(p_b, mask=mask_tk, other=0.0).to(tl.float32)         # [C,BK]
 
     b_alpha = tl.exp(b_g)
 
     cur_t_global = initial_t + i_n * C + o_c
     mod_t = cur_t_global % T_cycle
-    rho = tl.where(mod_t == 0, 1.0, mod_t.to(tl.float32) / T_cycle)
-    b_beta_tilde = b_beta * rho
+    rho = tl.where(mod_t == 0, 1.0, mod_t.to(tl.float32) / T_cycle)  # [C]
+    b_beta_tilde = b_beta * rho[:, None]   # [C,BK]
 
-    b_o = tl.zeros([C, BV], dtype=tl.float32)  # BV 列，最后 store 时用 (o_v < V) mask
+    b_o = tl.zeros([C, BV], dtype=tl.float32)
 
     start_t = initial_t + i_n * C
     rem = start_t % T_cycle
@@ -620,19 +625,18 @@ def chunk_kda_fwd_output_kernel(
     last_update_j = -1
     step = 0
 
-    while j < C:
+    while j < C:        
         mask_seg = (o_c > last_update_j) & (o_c <= j) & mask_t
 
         q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
         k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
         v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
         a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
-        b_seg = tl.where(mask_seg, b_beta_tilde, 0.0)
+        b_seg = tl.where(mask_seg[:, None], b_beta_tilde, 0.0)
 
         aq_seg = a_seg * q_seg
         ak_seg = a_seg * k_seg
-        dot_qk = tl.sum(q_seg * k_seg, axis=1)
-        c_seg_val = b_seg * dot_qk
+        c_seg_val = tl.sum(q_seg * k_seg * b_seg, axis=1)   # [C]
 
         p_aqk = Aqk + (base_bth + t * H + i_h)
         tl.store(p_aqk, c_seg_val, mask=mask_seg)
@@ -641,7 +645,7 @@ def chunk_kda_fwd_output_kernel(
         S_ak = tl.dot(ak_seg, b_S)
         b_o += term1 - (c_seg_val[:, None] * S_ak) + (c_seg_val[:, None] * v_seg)
 
-        # ==== 状态跳变更新 ====
+        # 状态跳变更新
         token_idx = i_n * C + j
         mask_u_t = token_idx < T
 
@@ -649,8 +653,8 @@ def chunk_kda_fwd_output_kernel(
 
         u_k = tl.load(k + offset * K + o_k, mask=(o_k < K) & mask_u_t, other=0.0).to(tl.float32)
         u_v = tl.load(v + offset * V + o_v, mask=(o_v < V) & mask_u_t, other=0.0).to(tl.float32)
-        u_alpha = tl.exp(tl.load(g + offset * K + o_k, mask=(o_k < K) & mask_u_t, other=-float("inf")).to(tl.float32))
-        u_beta = tl.load(beta + offset, mask=mask_u_t, other=0.0).to(tl.float32)
+        u_alpha = tl.exp(tl.load(g + offset * K + o_k, mask=(o_k < K) & mask_u_t, other=0).to(tl.float32))   # 越界时通过 other=0 达成 alpha=1, 保留原state而不是置0
+        u_beta = tl.load(beta + offset * K + o_k, mask=(o_k < K) & mask_u_t, other=0.0).to(tl.float32)
 
         a_S = u_alpha[:, None] * b_S
         k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
@@ -658,6 +662,7 @@ def chunk_kda_fwd_output_kernel(
 
         b_S = a_S - b_k_u[:, None] * k_a_S[None, :] + b_k_u[:, None] * u_v[None, :]
         
+        # intra_states [B, H, N, M, K, V] 存储每个 chunk 内每次跳变后的状态, 通过 step 控制索引
         p_intra = intra_states + (i_bh * N + i_n) * M * K * V + step * K * V + o_k[:, None] * V + o_v[None, :]
         tl.store(p_intra, b_S, mask=(o_k < K)[:, None] & (o_v < V)[None, :])
 
@@ -672,12 +677,11 @@ def chunk_kda_fwd_output_kernel(
         k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
         v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
         a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
-        b_seg = tl.where(mask_seg, b_beta_tilde, 0.0)
+        b_seg = tl.where(mask_seg[:, None], b_beta_tilde, 0.0)
 
         aq_seg = a_seg * q_seg
         ak_seg = a_seg * k_seg
-        dot_qk = tl.sum(q_seg * k_seg, axis=1)
-        c_seg_val = b_seg * dot_qk
+        c_seg_val = tl.sum(q_seg * k_seg * b_seg, axis=1)
 
         p_aqk = Aqk + (base_bth + t * H + i_h)
         tl.store(p_aqk, c_seg_val, mask=mask_seg)
@@ -712,7 +716,7 @@ def chunk_kda_bwd(
     V = v.shape[-1]
     C = chunk_size
     N = (T + C - 1) // C
-    M = C // T_cycle + 1  # 依然保持理论最大跳变次数上界
+    M = C // T_cycle + 1
 
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)

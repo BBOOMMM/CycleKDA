@@ -1,19 +1,21 @@
 import torch
 import triton
 
-from myfla import chunk_kda, fused_recurrent_kda
+# from myfla import chunk_kda, fused_recurrent_kda
+from myfla.chunk_vecbeta import chunk_kda
 
 
 def test_chunk_kda():
     torch.manual_seed(42)
     
-    B, T, H, K, V = 2, 128, 4, 64, 64
+    B, T, H, K, V = 2, 120, 4, 64, 64
     q = torch.randn(B, T, H, K).cuda()
     k = torch.randn(B, T, H, K).cuda()
     v = torch.randn(B, T, H, V).cuda()
     g = torch.randn(B, T, H, K).cuda()
     g = g - 2*g.max()
-    beta = torch.rand(B, T, H).sigmoid().cuda()
+    # beta = torch.rand(B, T, H).sigmoid().cuda()
+    beta = torch.rand(B, T, H, K).sigmoid().cuda()
     
     print("Testing pytorch...")
     o_pytorch, state_pytorch = chunk_kda(
@@ -101,7 +103,8 @@ def benchmark_chunk_kda_fwd(T, provider, B, H, K, V, dtype, T_cycle, initial_t, 
     v = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
     g = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
     g = g - 2 * g.max()
-    beta = torch.rand(B, T, H, device="cuda", dtype=dtype).sigmoid()
+    # beta = torch.rand(B, T, H, device="cuda", dtype=dtype).sigmoid()
+    beta = torch.rand(B, T, H, K, device="cuda", dtype=dtype).sigmoid()
 
     def run():
         o, _ = chunk_kda(
