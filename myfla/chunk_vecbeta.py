@@ -723,9 +723,7 @@ def chunk_kda_bwd(
     dv = torch.empty_like(v)
     dg = torch.empty_like(g)
     dbeta = torch.empty_like(beta)
-    # has_init = initial_state is not None
     d_initial_state = torch.empty((B, H, K, V), device=q.device, dtype=torch.float32) if initial_state is not None else None
-    # d_initial_state_ptr = d_initial_state if has_init else torch.empty((1,), device=q.device, dtype=torch.float32)
 
     BK = triton.next_power_of_2(K)
     BV = triton.next_power_of_2(V)
@@ -761,7 +759,7 @@ def chunk_kda_bwd(
         BK,
         BV,
         M,
-        LOAD_FINAL_STATE=(dht is not None),
+        LOAD_FINAL_STATE=(dht is not None),  # 训练时还是有的, 因为k_t, v_t等对 S 有贡献, S 影响 o, 所以需要梯度
         HAS_INITIAL_STATE=(initial_state is not None),
     )
     return dq, dk, dv, dg, dbeta, d_initial_state
@@ -786,8 +784,8 @@ def chunk_kda_bwd_kernel(
     beta,
     do,
     Aqk,
-    chunk_states,
-    intra_states,
+    chunk_states,  # [B, H, N, K, V]
+    intra_states,  # [B, H, N, M, K, V]
     dq,
     dk,
     dv,
@@ -818,53 +816,62 @@ def chunk_kda_bwd_kernel(
     o_k = tl.arange(0, BK)
     o_v = tl.arange(0, BV)
     o_c = tl.arange(0, C)
+    
+    mask_kv = (o_k < K)[:, None] & (o_v < V)[None, :]
 
     d_b_S = tl.zeros([BK, BV], dtype=tl.float32)
     if LOAD_FINAL_STATE:
         p_dht = dht + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
-        d_b_S = tl.load(p_dht, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+        d_b_S = tl.load(p_dht, mask=mask_kv, other=0.0).to(tl.float32)
 
     # 从最后一块 chunk 倒序计算
     for i_n in range(N - 1, -1, -1):
         t = i_n * C + o_c
         mask_t = t < T
         base_bth = i_b * T * H
+        base_tokens = base_bth + t[:, None] * H + i_h
         
-        # === 批量 Load 这一个 Chunk 内部所有的前向激活与梯度 ===
-        p_q = q + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
-        p_k = k + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
-        p_v = v + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
-        p_g = g + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
-        p_b = beta + (base_bth + t * H + i_h)
-        p_do = do + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
-        p_Aqk = Aqk + (base_bth + t * H + i_h)
+        p_q = q + base_tokens * K + o_k[None, :]      # [C, BK]
+        p_k = k + base_tokens * K + o_k[None, :]      # [C, BK]
+        p_v = v + base_tokens * V + o_v[None, :]      # [C, BV]
+        p_g = g + base_tokens * K + o_k[None, :]      # [C, BK]
+        p_b = beta + base_tokens * K + o_k[None, :]   # [C, BK]
+        p_do = do + base_tokens * V + o_v[None, :]    # [C, BV]
+        p_Aqk = Aqk + (base_bth + t * H + i_h)        # [C]
+        # Aqk 的含义
+          # c_seg_val = tl.sum(q_seg * k_seg * b_seg, axis=1)   # [C]
+          # p_aqk = Aqk + (base_bth + t * H + i_h)
+          # tl.store(p_aqk, c_seg_val, mask=mask_seg)
+        
+        mask_tk = mask_t[:, None] & (o_k < K)[None, :]
+        mask_tv = mask_t[:, None] & (o_v < V)[None, :]
 
-        b_q = tl.load(p_q, mask=mask_t[:, None] & (o_k < K)[None, :], other=0.0).to(tl.float32) * scale
-        b_k = tl.load(p_k, mask=mask_t[:, None] & (o_k < K)[None, :], other=0.0).to(tl.float32)
-        b_v = tl.load(p_v, mask=mask_t[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
-        b_g = tl.load(p_g, mask=mask_t[:, None] & (o_k < K)[None, :], other=-float("inf")).to(tl.float32)
-        b_beta = tl.load(p_b, mask=mask_t, other=0.0).to(tl.float32)
-        b_do = tl.load(p_do, mask=mask_t[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+        b_q = tl.load(p_q, mask=mask_tk, other=0.0).to(tl.float32) * scale
+        b_k = tl.load(p_k, mask=mask_tk, other=0.0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_tv, other=0.0).to(tl.float32)
+        b_g = tl.load(p_g, mask=mask_tk, other=-float("inf")).to(tl.float32)
+        b_beta = tl.load(p_b, mask=mask_tk, other=0.0).to(tl.float32)
+        b_do = tl.load(p_do, mask=mask_tv, other=0.0).to(tl.float32)
         b_Aqk = tl.load(p_Aqk, mask=mask_t, other=0.0).to(tl.float32)
-
         b_alpha = tl.exp(b_g)
+        
         cur_t_global = initial_t + i_n * C + o_c
         mod_t = cur_t_global % T_cycle
         rho = tl.where(mod_t == 0, 1.0, mod_t.to(tl.float32) / T_cycle)
-        b_beta_tilde = b_beta * rho
+        b_beta_tilde = b_beta * rho[:, None]
 
         b_dq = tl.zeros([C, BK], dtype=tl.float32)
         b_dk = tl.zeros([C, BK], dtype=tl.float32)
         b_dv = tl.zeros([C, BV], dtype=tl.float32)
         b_dg = tl.zeros([C, BK], dtype=tl.float32)
-        b_dbeta = tl.zeros([C], dtype=tl.float32)
+        b_dbeta = tl.zeros([C, BK], dtype=tl.float32)
 
-        # === 预计算跳变位置与次数 ===
         start_t = initial_t + i_n * C
         rem = start_t % T_cycle
         first_j = (T_cycle - rem) if rem != 0 else 0
         if start_t == 0 and first_j == 0:
             first_j += T_cycle
+        # first_j 是本 chunk 内第一个跳变位置
             
         num_updates = 0
         j = first_j
@@ -876,59 +883,63 @@ def chunk_kda_bwd_kernel(
 
         # 从该 Chunk 内部最末尾的一个状态开始往前溯
         step = num_updates
+        # 计算 intra_states 的 step, 索引 M 维度
 
-        # === 处理尾部不完整的 Segment（如果在最后一次跳变之后还有 tokens）===
+        # chunk 尾部不完整的 Segment, 处理最后一次跳变之后的 tokens
         if last_update_j < C - 1:
-            # 动态判断去哪取状态：如果没有过跳变（step=0），用原始块状态；否则用 intra_states
             if step == 0:
                 p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
-                b_S = tl.load(p_cs, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+                b_S = tl.load(p_cs, mask=mask_kv, other=0.0).to(tl.float32)
             else:
                 p_intra = intra_states + (i_bh * N + i_n) * M * K * V + (step - 1) * K * V + o_k[:, None] * V + o_v[None, :]
-                b_S = tl.load(p_intra, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
+                b_S = tl.load(p_intra, mask=mask_kv, other=0.0).to(tl.float32)
 
-            mask_seg = (o_c > last_update_j) & mask_t
+            mask_seg = (o_c > last_update_j) & mask_t            # > last_update_j, 跳变点是 second chunk 的最后一个
 
-            q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
-            k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
-            v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
-            a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
-            b_seg = tl.where(mask_seg, b_beta_tilde, 0.0)
-            do_seg = tl.where(mask_seg[:, None], b_do, 0.0)
-            c_seg_val = tl.where(mask_seg, b_Aqk, 0.0)
+            q_seg = tl.where(mask_seg[:, None], b_q, 0.0)        # [C, BK]
+            k_seg = tl.where(mask_seg[:, None], b_k, 0.0)        # [C, BK]
+            v_seg = tl.where(mask_seg[:, None], b_v, 0.0)        # [C, BV]
+            a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)    # [C, BK]
+            b_seg = tl.where(mask_seg[:, None], b_beta_tilde, 0.0)   # [C, BK]     
+            do_seg = tl.where(mask_seg[:, None], b_do, 0.0)      # [C, BV]
+            c_seg_val = tl.where(mask_seg, b_Aqk, 0.0)           # [C]
 
             aq_seg = a_seg * q_seg
             ak_seg = a_seg * k_seg
-            S_ak = tl.dot(ak_seg, b_S)
+            bk_seg = b_seg * k_seg
+            S_ak = tl.dot(ak_seg, b_S)  # [C, BK] @ [BK, BV] = [C, BV]
 
-            d_c_seg_val = tl.sum(do_seg * (v_seg - S_ak), axis=1)
-            d_S_ak = -c_seg_val[:, None] * do_seg
+            d_c_seg_val = tl.sum(do_seg * (v_seg - S_ak), axis=1)  # [C]
+            d_S_ak = -c_seg_val[:, None] * do_seg   # [C, BV]
 
-            d_aq_seg = tl.dot(do_seg, tl.trans(b_S))
-            d_b_S_1 = tl.dot(tl.trans(aq_seg), do_seg)
-            d_ak_seg = tl.dot(d_S_ak, tl.trans(b_S))
-            d_b_S_2 = tl.dot(tl.trans(ak_seg), d_S_ak)
+            d_aq_seg = tl.dot(do_seg, tl.trans(b_S))     # [C, BV] @ [BV, BK] = [C, BK]
+            d_b_S_1 = tl.dot(tl.trans(aq_seg), do_seg)   # [BK, C] @ [C, BV] = [BK, BV]
+            d_ak_seg = tl.dot(d_S_ak, tl.trans(b_S))     # [C, BV] @ [BV, BK] = [C, BK]
+            d_b_S_2 = tl.dot(tl.trans(ak_seg), d_S_ak)   # [BK, C] @ [C, BV] = [BK, BV]
             
-            d_dot_qk = d_c_seg_val * b_seg
+            # d_dot_qk = d_c_seg_val * b_seg
 
-            b_dq += (d_dot_qk[:, None] * k_seg + d_aq_seg * a_seg) * scale
-            b_dk += (d_dot_qk[:, None] * q_seg + d_ak_seg * a_seg)
+            # b_dq += (d_dot_qk[:, None] * k_seg + d_aq_seg * a_seg) * scale
+            b_dq += (d_c_seg_val[:, None] * bk_seg + d_aq_seg * a_seg) * scale   # [C, BK]
+            # b_dk += (d_dot_qk[:, None] * q_seg + d_ak_seg * a_seg)
+            b_dk += (d_c_seg_val[:, None] * q_seg * b_seg + d_ak_seg * a_seg)    # [C, BK]
             b_dv += c_seg_val[:, None] * do_seg
             b_dg += (d_aq_seg * q_seg + d_ak_seg * k_seg) * a_seg
-            b_dbeta += d_c_seg_val * tl.sum(q_seg * k_seg, axis=1) * rho
+            # b_dbeta += d_c_seg_val * tl.sum(q_seg * k_seg, axis=1) * rho   # TODO
+            b_dbeta += d_c_seg_val[:, None] * q_seg * k_seg * rho[:, None]                # [C, BK]
 
             d_b_S += d_b_S_1 + d_b_S_2
 
-        # === 依次倒序处理所有的 State Jump 和 Jump 前的 Segment ===
+        # 依次倒序处理所有的 State Jump 和 Jump 前的 Segment
         j = last_update_j
         step = num_updates - 1
         
         while step >= 0:
             prev_j = j - T_cycle
-            if step == 0:
+            if step == 0:   # 这是本 chunk 从后往前的最后一个跳变点
                 prev_j = -1
             
-            # 加载 Jump `j` 发生前的状态 b_S
+            # 加载 Jump j 发生前的状态 b_S
             if step == 0:
                 p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
                 b_S = tl.load(p_cs, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
@@ -936,31 +947,30 @@ def chunk_kda_bwd_kernel(
                 p_intra = intra_states + (i_bh * N + i_n) * M * K * V + (step - 1) * K * V + o_k[:, None] * V + o_v[None, :]
                 b_S = tl.load(p_intra, mask=(o_k < K)[:, None] & (o_v < V)[None, :], other=0.0).to(tl.float32)
 
-            mask_j = (o_c == j) & mask_t
+            mask_j = (o_c == j) & mask_t   # 跳变点的 j token
             token_idx = i_n * C + j
 
             # 反向传播 State Update 逻辑 (发生在 t=token_idx 处)
             if token_idx < T:
                 offset = base_bth + token_idx * H + i_h
-                u_k = tl.load(k + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32)
-                u_v = tl.load(v + offset * V + o_v, mask=(o_v < V), other=0.0).to(tl.float32)
-                u_alpha = tl.exp(tl.load(g + offset * K + o_k, mask=(o_k < K), other=-float("inf")).to(tl.float32))
-                u_beta = tl.load(beta + offset).to(tl.float32)
+                u_k = tl.load(k + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32)   # [BK]
+                u_v = tl.load(v + offset * V + o_v, mask=(o_v < V), other=0.0).to(tl.float32)   # [BV]
+                u_alpha = tl.exp(tl.load(g + offset * K + o_k, mask=(o_k < K), other=-float("inf")).to(tl.float32))   # [BK]
+                u_beta = tl.load(beta + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32)
 
-                a_S = u_alpha[:, None] * b_S
-                k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
-                b_k_u = u_beta * u_k
+                a_S = u_alpha[:, None] * b_S    # [BK, BV]
+                k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)   # [BV]
+                b_k_u = u_beta * u_k            # [BK]
 
-                # 通过链式法则求梯度，向过去推导 d_b_S
                 d_a_S = d_b_S + 0.0
-                d_b_k_u = tl.sum(d_b_S * (u_v[None, :] - k_a_S[None, :]), axis=1)
+                d_b_k_u = tl.sum(d_b_S * (u_v[None, :] - k_a_S[None, :]), axis=1)   # [BK]
                 d_k_a_S = tl.sum(d_b_S * (-b_k_u[:, None]), axis=0)
                 d_u_v = tl.sum(d_b_S * b_k_u[:, None], axis=0)
 
                 d_u_k_1 = tl.sum(d_k_a_S[None, :] * a_S, axis=1)
                 d_a_S += d_k_a_S[None, :] * u_k[:, None]
 
-                d_u_beta = tl.sum(d_b_k_u * u_k)
+                d_u_beta = d_b_k_u * u_k   # [BK]
                 d_u_k_2 = d_b_k_u * u_beta
 
                 d_u_alpha = tl.sum(d_a_S * b_S, axis=1)
@@ -972,7 +982,7 @@ def chunk_kda_bwd_kernel(
                 b_dk += tl.where(mask_j[:, None], d_u_k[None, :], 0.0)
                 b_dv += tl.where(mask_j[:, None], d_u_v[None, :], 0.0)
                 b_dg += tl.where(mask_j[:, None], d_u_g[None, :], 0.0)
-                b_dbeta += tl.where(mask_j, d_u_beta, 0.0)
+                b_dbeta += tl.where(mask_j[:, None], d_u_beta[None, :], 0.0)
 
             # 反向传播 Jump 前的 Segment (范围: prev_j < t <= j)
             mask_seg = (o_c > prev_j) & (o_c <= j) & mask_t
@@ -981,12 +991,13 @@ def chunk_kda_bwd_kernel(
             k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
             v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
             a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
-            b_seg = tl.where(mask_seg, b_beta_tilde, 0.0)
+            b_seg = tl.where(mask_seg[:, None], b_beta_tilde, 0.0)
             do_seg = tl.where(mask_seg[:, None], b_do, 0.0)
             c_seg_val = tl.where(mask_seg, b_Aqk, 0.0)
 
             aq_seg = a_seg * q_seg
             ak_seg = a_seg * k_seg
+            bk_seg = b_seg * k_seg
             S_ak = tl.dot(ak_seg, b_S)
 
             d_c_seg_val = tl.sum(do_seg * (v_seg - S_ak), axis=1)
@@ -997,34 +1008,36 @@ def chunk_kda_bwd_kernel(
             d_ak_seg = tl.dot(d_S_ak, tl.trans(b_S))
             d_b_S_2 = tl.dot(tl.trans(ak_seg), d_S_ak)
             
-            d_dot_qk = d_c_seg_val * b_seg
+            # d_dot_qk = d_c_seg_val * b_seg
 
-            b_dq += (d_dot_qk[:, None] * k_seg + d_aq_seg * a_seg) * scale
-            b_dk += (d_dot_qk[:, None] * q_seg + d_ak_seg * a_seg)
+            # b_dq += (d_dot_qk[:, None] * k_seg + d_aq_seg * a_seg) * scale
+            b_dq += (d_c_seg_val[:, None] * bk_seg + d_aq_seg * a_seg) * scale   # [C, BK]
+            # b_dk += (d_dot_qk[:, None] * q_seg + d_ak_seg * a_seg)
+            b_dk += (d_c_seg_val[:, None] * q_seg * b_seg + d_ak_seg * a_seg)    # [C, BK]
             b_dv += c_seg_val[:, None] * do_seg
             b_dg += (d_aq_seg * q_seg + d_ak_seg * k_seg) * a_seg
-            b_dbeta += d_c_seg_val * tl.sum(q_seg * k_seg, axis=1) * rho
+            # b_dbeta += d_c_seg_val * tl.sum(q_seg * k_seg, axis=1) * rho
+            b_dbeta += d_c_seg_val[:, None] * q_seg * k_seg * rho[:, None]                # [C, BK]
             
-            # 此处的梯度再叠加到全局 d_b_S 上，然后倒退下一个环节
+            # 叠加到全局 d_b_S 上，然后倒退下一个second chunk
             d_b_S += d_b_S_1 + d_b_S_2
 
             j -= T_cycle
             step -= 1
 
-        # === 写入当前 Chunk 的所有梯度 ===
-        p_dq = dq + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
-        p_dk = dk + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
-        p_dv = dv + (base_bth + t[:, None] * H + i_h) * V + o_v[None, :]
-        p_dg = dg + (base_bth + t[:, None] * H + i_h) * K + o_k[None, :]
-        p_dbeta = dbeta + (base_bth + t * H + i_h)
+        p_dq = dq + base_tokens * K + o_k[None, :]
+        p_dk = dk + base_tokens * K + o_k[None, :]
+        p_dv = dv + base_tokens * V + o_v[None, :]
+        p_dg = dg + base_tokens * K + o_k[None, :]
+        p_dbeta = dbeta + base_tokens * K + o_k[None, :]
         
-        tl.store(p_dq, b_dq, mask=mask_t[:, None] & (o_k < K)[None, :])
-        tl.store(p_dk, b_dk, mask=mask_t[:, None] & (o_k < K)[None, :])
-        tl.store(p_dv, b_dv, mask=mask_t[:, None] & (o_v < V)[None, :])
-        tl.store(p_dg, b_dg, mask=mask_t[:, None] & (o_k < K)[None, :])
-        tl.store(p_dbeta, b_dbeta, mask=mask_t)
+        tl.store(p_dq, b_dq, mask=mask_tk)
+        tl.store(p_dk, b_dk, mask=mask_tk)
+        tl.store(p_dv, b_dv, mask=mask_tv)
+        tl.store(p_dg, b_dg, mask=mask_tk)
+        tl.store(p_dbeta, b_dbeta, mask=mask_tk)
 
-    # N 个 chunk 全部处理完，此时的 d_b_S 即是传回初始状态 (initial_state) 的梯度
+    # N 个 chunk 全部处理完，此时的 d_b_S 即是传回初始状态 initial_state 的梯度
     if HAS_INITIAL_STATE:
         p_d_init = d_initial_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
-        tl.store(p_d_init, d_b_S, mask=(o_k < K)[:, None] & (o_v < V)[None, :])
+        tl.store(p_d_init, d_b_S, mask=mask_kv)

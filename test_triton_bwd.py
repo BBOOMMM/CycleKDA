@@ -1,7 +1,8 @@
 import torch
 import triton
 
-from myfla import chunk_kda, fused_recurrent_kda
+# from myfla import chunk_kda, fused_recurrent_kda
+from myfla.chunk_vecbeta import chunk_kda
 
 
 def _assert_close(name: str, a: torch.Tensor, b: torch.Tensor, rtol: float, atol: float):
@@ -37,7 +38,8 @@ def test_chunk_kda_bwd(
     v0 = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
     g0 = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
     g0 = g0 - 2 * g0.max()
-    beta0 = torch.rand(B, T, H, device="cuda", dtype=dtype).sigmoid()
+    # beta0 = torch.rand(B, T, H, device="cuda", dtype=dtype).sigmoid()
+    beta0 = torch.rand(B, T, H, K, device="cuda", dtype=dtype).sigmoid()
 
     def run(provider: str):
         q = q0.clone().detach().requires_grad_(True)
@@ -157,7 +159,8 @@ def benchmark_chunk_kda_bwd(
     v = torch.randn(B, T, H, V, device="cuda", dtype=dtype, requires_grad=True)
     g = torch.randn(B, T, H, K, device="cuda", dtype=dtype, requires_grad=True)
     g = (g - 2 * g.max()).detach().requires_grad_(True)
-    beta = torch.rand(B, T, H, device="cuda", dtype=dtype).sigmoid().detach().requires_grad_(True)
+    # beta = torch.rand(B, T, H, device="cuda", dtype=dtype).sigmoid().detach().requires_grad_(True)
+    beta = torch.rand(B, T, H, K, device="cuda", dtype=dtype).sigmoid().detach().requires_grad_(True)
 
     def run():
         # 清 grad（用 None 更快）
@@ -193,6 +196,6 @@ if __name__ == "__main__":
     # test_chunk_kda_bwd(T=128, dtype=torch.float16, include_state_in_loss=False)
 
     # 若你已实现 dht/final_state 的 backward，再打开这一行
-    test_chunk_kda_bwd(T=120, dtype=torch.float16, include_state_in_loss=True, use_qk_l2norm_in_kernel=False)
+    test_chunk_kda_bwd(T=120, dtype=torch.float16, include_state_in_loss=False, use_qk_l2norm_in_kernel=False)
 
     benchmark_chunk_kda_bwd.run(save_path=".", print_data=False)
