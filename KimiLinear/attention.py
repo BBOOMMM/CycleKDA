@@ -168,6 +168,7 @@ class KimiDeltaAttention(nn.Module):
                 cu_seqlens=cu_seqlens,
                 initial_t=past_len,
                 T_cycle=self.T_cycle,
+                use_triton=True,
             )
         else:                  # 推理剩余步
             past_len = getattr(cache_params, "seen_tokens", 0) if cache_params is not None else 0

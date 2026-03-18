@@ -28,7 +28,7 @@ def chunk_kda(
     initial_t: int = 0,
     T_cycle: int = 8,
     chunk_indices: torch.LongTensor | None = None,
-    use_triton: bool = False,
+    use_triton: bool = True,
     **kwargs,
 ):
     if cu_seqlens is not None:
