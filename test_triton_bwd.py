@@ -24,15 +24,11 @@ def test_chunk_kda_bwd(
     T_cycle: int = 8,
     initial_t: int = 0,
     use_qk_l2norm_in_kernel: bool = True,
-    include_state_in_loss: bool = False,  # 若你的 Triton bwd 还没支持 dht，可保持 False
+    include_state_in_loss: bool = False,
+    seed: int = 0,
 ):
-    """
-    对比 PyTorch vs Triton 的 backward 梯度（dq/dk/dv/dg/dbeta）。
-    include_state_in_loss=True 会让 final_state 也进入 loss，从而测试 dht 路径。
-    """
     torch.manual_seed(0)
-
-    # 用同一份 base 输入，分别 clone 给两个 provider，保证数值一致
+    
     q0 = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
     k0 = torch.randn(B, T, H, K, device="cuda", dtype=dtype)
     v0 = torch.randn(B, T, H, V, device="cuda", dtype=dtype)
@@ -95,10 +91,6 @@ def test_chunk_kda_bwd(
 
     dq_p, dk_p, dv_p, dg_p, dbeta_p = run("pytorch")
     dq_t, dk_t, dv_t, dg_t, dbeta_t = run("triton")
-
-    # float16 的梯度误差通常比 forward 大一些，先用相对宽松阈值跑通
-    rtol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 5e-4
-    atol = 2e-2 if dtype in (torch.float16, torch.bfloat16) else 5e-4
     
     rtol = 1e-5
     atol = 1e-5
@@ -115,6 +107,7 @@ def test_chunk_kda_bwd(
     )
 
 
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["T"],
@@ -125,22 +118,21 @@ def test_chunk_kda_bwd(
         line_names=["PyTorch", "Triton"],
         styles=[("black", "-"), ("blue", "-")],
         ylabel="ms",
-        plot_name="chunk_kda_bwd_ms",
+        plot_name="chunk_kda_bwd_ms_vs_T",
         args={
-            "B": 2,
-            "H": 4,
+            "B": 16,
+            "H": 8,
             "K": 64,
             "V": 64,
             "dtype": torch.float16,
             "T_cycle": 8,
             "initial_t": 0,
-            # 重要：先关掉，否则 pytorch 分支 dq/dk 可能断图导致 benchmark 不可比
             "use_qk_l2norm_in_kernel": False,
-            "include_state_in_loss": False,  # 若你已支持 dht 路径再打开
+            "include_state_in_loss": True,
         },
     )
 )
-def benchmark_chunk_kda_bwd(
+def benchmark_chunk_kda_bwd_vs_T(
     T,
     provider,
     B,
@@ -163,7 +155,153 @@ def benchmark_chunk_kda_bwd(
     beta = torch.rand(B, T, H, K, device="cuda", dtype=dtype).sigmoid().detach().requires_grad_(True)
 
     def run():
-        # 清 grad（用 None 更快）
+        q.grad = None
+        k.grad = None
+        v.grad = None
+        g.grad = None
+        beta.grad = None
+
+        o, st = chunk_kda(
+            q=q, k=k, v=v, g=g, beta=beta,
+            initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=None,
+            initial_t=initial_t,
+            T_cycle=T_cycle,
+            use_triton=(provider == "triton"),
+        )
+
+        loss = o.float().mean()
+        if include_state_in_loss:
+            loss = loss + 0.1 * st.float().mean()
+
+        loss.backward()
+
+    ms = triton.testing.do_bench(run, warmup=30, rep=200)
+    return ms
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["B"],
+        x_vals=[32, 64, 128, 256, 512, 1024],
+        x_log=True,
+        line_arg="provider",
+        line_vals=["pytorch", "triton"],
+        line_names=["PyTorch", "Triton"],
+        styles=[("black", "-"), ("blue", "-")],
+        ylabel="ms",
+        plot_name="chunk_kda_bwd_ms_vs_B",
+        args={
+            "T": 128,
+            "H": 8,
+            "K": 64,
+            "V": 64,
+            "dtype": torch.float16,
+            "T_cycle": 8,
+            "initial_t": 0,
+            "use_qk_l2norm_in_kernel": False,
+            "include_state_in_loss": True,
+        },
+    )
+)
+def benchmark_chunk_kda_bwd_vs_B(
+    T,
+    provider,
+    B,
+    H,
+    K,
+    V,
+    dtype,
+    T_cycle,
+    initial_t,
+    use_qk_l2norm_in_kernel,
+    include_state_in_loss,
+):
+    torch.manual_seed(0)
+    q = torch.randn(B, T, H, K, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype, requires_grad=True)
+    g = torch.randn(B, T, H, K, device="cuda", dtype=dtype, requires_grad=True)
+    g = (g - 2 * g.max()).detach().requires_grad_(True)
+    # beta = torch.rand(B, T, H, device="cuda", dtype=dtype).sigmoid().detach().requires_grad_(True)
+    beta = torch.rand(B, T, H, K, device="cuda", dtype=dtype).sigmoid().detach().requires_grad_(True)
+
+    def run():
+        q.grad = None
+        k.grad = None
+        v.grad = None
+        g.grad = None
+        beta.grad = None
+
+        o, st = chunk_kda(
+            q=q, k=k, v=v, g=g, beta=beta,
+            initial_state=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            cu_seqlens=None,
+            initial_t=initial_t,
+            T_cycle=T_cycle,
+            use_triton=(provider == "triton"),
+        )
+
+        loss = o.float().mean()
+        if include_state_in_loss:
+            loss = loss + 0.1 * st.float().mean()
+
+        loss.backward()
+
+    ms = triton.testing.do_bench(run, warmup=30, rep=200)
+    return ms
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["K", "V"],
+        x_vals=[(32,32), (64, 64), (128,128), (256,256)],
+        x_log=True,
+        line_arg="provider",
+        line_vals=["pytorch", "triton"],
+        line_names=["PyTorch", "Triton"],
+        styles=[("black", "-"), ("blue", "-")],
+        ylabel="ms",
+        plot_name="chunk_kda_bwd_ms_vs_KV",
+        args={
+            "T": 128,
+            "B": 16,
+            "H": 8,
+            "dtype": torch.float16,
+            "T_cycle": 8,
+            "initial_t": 0,
+            "use_qk_l2norm_in_kernel": False,
+            "include_state_in_loss": True,
+        },
+    )
+)
+def benchmark_chunk_kda_bwd_vs_KV(
+    T,
+    provider,
+    B,
+    H,
+    K,
+    V,
+    dtype,
+    T_cycle,
+    initial_t,
+    use_qk_l2norm_in_kernel,
+    include_state_in_loss,
+):
+    torch.manual_seed(0)
+    q = torch.randn(B, T, H, K, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=dtype, requires_grad=True)
+    g = torch.randn(B, T, H, K, device="cuda", dtype=dtype, requires_grad=True)
+    g = (g - 2 * g.max()).detach().requires_grad_(True)
+    # beta = torch.rand(B, T, H, device="cuda", dtype=dtype).sigmoid().detach().requires_grad_(True)
+    beta = torch.rand(B, T, H, K, device="cuda", dtype=dtype).sigmoid().detach().requires_grad_(True)
+
+    def run():
         q.grad = None
         k.grad = None
         v.grad = None
@@ -192,10 +330,9 @@ def benchmark_chunk_kda_bwd(
 
 
 if __name__ == "__main__":
-    # backward 对齐测试：先不把 final_state 放入 loss（避免 dht 路径未实现导致失败）
-    # test_chunk_kda_bwd(T=128, dtype=torch.float16, include_state_in_loss=False)
+    for seed in range(5):
+        test_chunk_kda_bwd(T=120, dtype=torch.float16, include_state_in_loss=False, use_qk_l2norm_in_kernel=False, seed=seed)
 
-    # 若你已实现 dht/final_state 的 backward，再打开这一行
-    test_chunk_kda_bwd(T=120, dtype=torch.float16, include_state_in_loss=False, use_qk_l2norm_in_kernel=False)
-
-    benchmark_chunk_kda_bwd.run(save_path=".", print_data=False)
+    benchmark_chunk_kda_bwd_vs_B.run(save_path=".", print_data=False)
+    benchmark_chunk_kda_bwd_vs_T.run(save_path=".", print_data=False)
+    benchmark_chunk_kda_bwd_vs_KV.run(save_path=".", print_data=False)

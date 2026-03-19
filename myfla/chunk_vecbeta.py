@@ -359,7 +359,7 @@ class ChunkKDAFunction(torch.autograd.Function):
                 dbias = dbias.to(dt_bias)
 
         return (
-            dq, dk, dv, dg, dbeta, dA_log, ddt_bias, None, None,
+            dq, dk, dv, dg, dbeta, dA_log, ddt_bias, None, d_initial_state,
             None, None, None, None, None, None, None
         )
     
@@ -457,8 +457,8 @@ def chunk_kda_fwd(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [1, 2, 3, 4]
+        for num_warps in [2, 4, 8]
+        for num_stages in [1, 2]
     ],
     key=['H', 'K', 'V', 'C'],
     use_cuda_graph=USE_CUDA_GRAPH,
@@ -546,8 +546,8 @@ def chunk_kda_fwd_state_kernel(
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4]
-        for num_stages in [1, 2, 3, 4]
+        for num_warps in [2, 4, 8]
+        for num_stages in [1, 2]
     ],
     key=['H', 'K', 'V', 'C'],
     use_cuda_graph=USE_CUDA_GRAPH,
@@ -769,7 +769,7 @@ def chunk_kda_bwd(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
-        for num_stages in[1, 2, 3, 4]
+        for num_stages in[1, 2]
     ],
     key=['H', 'K', 'V', 'C'],
     use_cuda_graph=USE_CUDA_GRAPH,
