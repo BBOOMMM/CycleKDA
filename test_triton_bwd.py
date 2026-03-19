@@ -259,7 +259,7 @@ def benchmark_chunk_kda_bwd_vs_B(
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["K", "V"],
-        x_vals=[(32,32), (64, 64), (128,128), (256,256)],
+        x_vals=[(32,32), (64, 64), (128, 128)],
         x_log=True,
         line_arg="provider",
         line_vals=["pytorch", "triton"],
@@ -331,8 +331,8 @@ def benchmark_chunk_kda_bwd_vs_KV(
 
 if __name__ == "__main__":
     for seed in range(5):
-        test_chunk_kda_bwd(T=120, dtype=torch.float16, include_state_in_loss=False, use_qk_l2norm_in_kernel=False, seed=seed)
+        test_chunk_kda_bwd(T=120, dtype=torch.float16, include_state_in_loss=True, use_qk_l2norm_in_kernel=False, seed=seed)
 
-    benchmark_chunk_kda_bwd_vs_B.run(save_path=".", print_data=False)
-    benchmark_chunk_kda_bwd_vs_T.run(save_path=".", print_data=False)
+    # benchmark_chunk_kda_bwd_vs_T.run(save_path=".", print_data=False)
+    # benchmark_chunk_kda_bwd_vs_B.run(save_path=".", print_data=False)
     benchmark_chunk_kda_bwd_vs_KV.run(save_path=".", print_data=False)

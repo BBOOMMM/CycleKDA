@@ -268,8 +268,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             k, k_rstd = l2norm_fwd(k)
         
         chunk_size = 64
-        
-        
+                
         o, Aqk, final_state, chunk_states, intra_states = chunk_kda_fwd(
             q=q,
             k=k,
@@ -283,6 +282,7 @@ class ChunkKDAFunction(torch.autograd.Function):
             initial_t=initial_t,
             T_cycle=T_cycle,
             chunk_indices=chunk_indices,
+            chunk_size=chunk_size,
         )
         
         
