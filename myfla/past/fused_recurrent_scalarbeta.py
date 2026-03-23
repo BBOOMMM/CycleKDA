@@ -29,10 +29,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     cu_seqlens,
     scale,
     T,
-    initial_t,
-    T_cycle: tl.constexpr,
+    initial_t,                  # 新增：起始时间偏移（seen_tokens）
+    T_cycle: tl.constexpr,      # 新增：状态更新周期 T
     B: tl.constexpr,
     H: tl.constexpr,
+    HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BK: tl.constexpr,
@@ -47,7 +48,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     IS_VARLEN: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)   # i_nh = N * HV
-    i_n, i_h = i_nh // H, i_nh % H   # i_n 表示处理第几个样本，i_hv 表示处理第几个head
+    i_n, i_hv = i_nh // HV, i_nh % HV   # i_n 表示处理第几个样本，i_hv 表示处理 v 的第几个head
+    i_h = i_hv // (HV // H)  # 这里和 i_hv 一样
 
     if IS_VARLEN:
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
@@ -65,22 +67,22 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     #     values of shape `[B, T, HV, V]`.
     #     GVA is applied if `HV > H`.
     # 取的是对应样本、对应head的分块q、k、v，均为向量，其中q、k是直接取一整行，v在行上进一步进行了切分
-    p_q = q + bos*H*K + i_h*K + o_k          # 现在是 t=0 时刻，后面对 i_t 进行循环，会加上 T 维度的 stride
-    p_k = k + bos*H*K + i_h*K + o_k
-    p_v = v + bos*H*V + i_h*V + o_v
+    p_q = q + (bos * H + i_h) * K + o_k          # 现在是 t=0 时刻，后面对 i_t 进行循环，会加上 T 维度的 stride
+    p_k = k + (bos * H + i_h) * K + o_k
+    p_v = v + (bos * HV + i_hv) * V + o_v
     if USE_G:
-        p_g = g + bos * H + i_h
+        p_g = g + bos * HV + i_hv
     if USE_GK:
-        p_gk = gk + bos*H*K + i_h*K + o_k
+        p_gk = gk + (bos * HV + i_hv) * K + o_k
     if USE_GV:
-        p_gv = gv + bos*H*V + i_h*V + o_v
+        p_gv = gv + (bos * HV + i_hv) * V + o_v
     if IS_BETA_HEADWISE:
-        p_beta = beta + bos*H + i_h
-    else:
         # 走这里
-        p_beta = beta + bos*H*K + i_h*K + o_k
+        p_beta = beta + bos * HV + i_hv
+    else:
+        p_beta = beta + (bos * HV + i_hv) * V + o_v
 
-    p_o = o + bos*H*V + i_h*V + o_v
+    p_o = o + (bos * HV + i_hv) * V + o_v
 
     mask_k = o_k < K
     mask_v = o_v < V
@@ -88,7 +90,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)  # [BK, BV]
     if USE_INITIAL_STATE:
-        p_h0 = h0 + i_nh*K*V + o_k[:, None] * V + o_v[None, :]
+        p_h0 = h0 + i_nh * K*V + o_k[:, None] * V + o_v[None, :]
         b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
 
     # b_h 不应该被反复修改，只需要在 cur_t % T_cycle == 0 时刻更新，在 b_h 基础上计算得到 b_h_top 即可
@@ -110,7 +112,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         if IS_BETA_HEADWISE:
             b_beta = tl.load(p_beta).to(tl.float32)
         else:
-            b_beta = tl.load(p_beta, mask=mask_k, other=0).to(tl.float32)
+            b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
             
         # [BK, BV]
         if USE_G:
@@ -119,17 +121,17 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
         if USE_GK:
             b_gk = tl.load(p_gk).to(tl.float32)  # [BK]
-            b_h_top *= exp(b_gk[:, None])  # [BK, BV] * [BK, 1]  ->  [BK, BV] * [BK, BV]
+            b_h_top *= exp(b_gk[:, None])  # [BK, BV] * [BK, 1]  ->  [BK, BV] * [BK, BV]  发生广播
 
         if USE_GV:
             b_gv = tl.load(p_gv).to(tl.float32)
             b_h_top *= exp(b_gv[None, :])
         
-        b_v_update = b_v - tl.sum(b_h_top * b_k[:, None], axis=0)   # [BV] - [BV]  ->  [BV]
-        b_h_top += (rho_t * b_beta * b_k)[:, None] * b_v_update[None, :]   # [BK, 1] * [1, BV]  ->  [BK, BV]
+        b_v_update = rho_t * b_beta * (b_v - tl.sum(b_h_top * b_k[:, None], 0))   # tl.sum(..., 0) 表示沿着 第 0 维（行方向） 进行求和，最后剩下一行，完成的是向量和矩阵相乘
+        b_h_top += b_k[:, None] * b_v_update[None, :]   # [BK, 1] * [BV]  ->  [BK, 1] * [1, BV]  发生广播，外积
         
         # [BV]
-        b_o = tl.sum(b_h_top * b_q[:, None], axis=0)
+        b_o = tl.sum(b_h_top * b_q[:, None], 0)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         
@@ -138,15 +140,15 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
 
         p_q += H*K
         p_k += H*K
-        p_v += H*V
+        p_v += HV*V
         if USE_G:
-            p_g += H
+            p_g += HV
         if USE_GK:
-            p_gk += H*K
+            p_gk += HV*K
         if USE_GV:
-            p_gv += H*V
-        p_beta += H * (1 if IS_BETA_HEADWISE else K)
-        p_o += H*V
+            p_gv += HV*V
+        p_beta += HV * (1 if IS_BETA_HEADWISE else V)
+        p_o += HV*V
 
     if STORE_FINAL_STATE:
         p_ht = ht + i_nh * K*V + o_k[:, None] * V + o_v[None, :]
@@ -166,19 +168,20 @@ def fused_recurrent_gated_delta_rule_fwd(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.LongTensor | None = None,
-    initial_t: int = 0,
-    T_cycle: int = 8,
+    initial_t: int = 0,                # 新增：起始时间偏移（seen_tokens）
+    T_cycle: int = 8,                  # 新增：状态更新周期 T
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
-    N = B if cu_seqlens is None else len(cu_seqlens) - 1
+    HV = v.shape[2]
+    N = B if cu_seqlens is None else len(cu_seqlens) - 1    # N 表示有几个样本，几条序列
     BK = triton.next_power_of_2(K)
     BV = min(8, triton.next_power_of_2(V)) if gv is None else triton.next_power_of_2(V)
     NV = triton.cdiv(V, BV)
 
-    o = torch.empty_like(v)
-    final_state = q.new_empty(N, H, K, V, dtype=torch.float32) if output_final_state else None
+    o = torch.empty_like(v)   # [B, T, HV, V]  注意 T 小于等于 64
+    final_state = q.new_empty(N, HV, K, V, dtype=torch.float32) if output_final_state else None
 
-    grid = (NV, N * H)
+    grid = (NV, N * HV)
     fused_recurrent_gated_delta_rule_fwd_kernel[grid](
         q=q,
         k=k,
@@ -193,10 +196,11 @@ def fused_recurrent_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         scale=scale,
         T=T,
-        initial_t=initial_t,
-        T_cycle=T_cycle,
+        initial_t=initial_t,                # 新增：起始时间偏移（seen_tokens）
+        T_cycle=T_cycle,                    # 新增：状态更新周期 T
         B=B,
         H=H,
+        HV=HV,
         K=K,
         V=V,
         BK=BK,
@@ -227,8 +231,8 @@ class FusedRecurrentFunction(torch.autograd.Function):
         output_final_state: bool = False,
         use_qk_l2norm_in_kernel: bool = False,
         cu_seqlens: torch.LongTensor | None = None,
-        initial_t: int = 0,
-        T_cycle: int = 8,
+        initial_t: int = 0,                # 新增：起始时间偏移（seen_tokens）
+        T_cycle: int = 8,                  # 新增：状态更新周期 T
     ):
         o, final_state = fused_recurrent_gated_delta_rule_fwd(
             q=q,
@@ -243,8 +247,8 @@ class FusedRecurrentFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             cu_seqlens=cu_seqlens,
-            initial_t=initial_t,
-            T_cycle=T_cycle,
+            initial_t=initial_t,                # 新增：起始时间偏移（seen_tokens）
+            T_cycle=T_cycle,                 # 新增：状态更新周期 T
         )
 
         return o, final_state
@@ -291,7 +295,7 @@ def fused_recurrent_gated_delta_rule(
         gv (torch.Tensor):
             gv (decays) of shape `[B, T, HV, V]`. Default: `None`.
         beta (torch.Tensor):
-            betas of shape `[B, T, HV, K]`.
+            betas of shape `[B, T, HV]`.
         scale (Optional[float]):
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
@@ -324,7 +328,7 @@ def fused_recurrent_gated_delta_rule(
         >>> k = F.normalize(torch.randn(B, T, H, K, device='cuda'), p=2, dim=-1)
         >>> v = torch.randn(B, T, HV, V, device='cuda')
         >>> g = F.logsigmoid(torch.rand(B, T, HV, device='cuda'))
-        >>> beta = torch.rand(B, T, HV, K, device='cuda').sigmoid()
+        >>> beta = torch.rand(B, T, HV, device='cuda').sigmoid()
         >>> h0 = torch.randn(B, HV, K, V, device='cuda')
         >>> o, ht = fused_gated_recurrent_delta_rule(
             q, k, v, g, beta,
@@ -356,7 +360,7 @@ def fused_recurrent_gated_delta_rule(
     if scale is None:
         scale = k.shape[-1] ** -0.5
     if beta is None:
-        beta = torch.ones_like(q)
+        beta = torch.ones_like(q[..., 0])
 
     o, final_state = FusedRecurrentFunction.apply(
         q,
@@ -404,7 +408,7 @@ def fused_recurrent_kda(
         g (torch.Tensor):
             g (decays) of shape `[B, T, HV, K]`.
         beta (torch.Tensor):
-            betas of shape `[B, T, HV, K]`.
+            betas of shape `[B, T, HV]`.
         scale (Optional[float]):
             Scale factor for the RetNet attention scores.
             If not provided, it will default to `1 / sqrt(K)`. Default: `None`.
@@ -437,7 +441,7 @@ def fused_recurrent_kda(
         >>> k = F.normalize(torch.randn(B, T, H, K, device='cuda'), p=2, dim=-1)
         >>> v = torch.randn(B, T, HV, V, device='cuda')
         >>> g = F.logsigmoid(torch.rand(B, T, HV, K, device='cuda'))
-        >>> beta = torch.rand(B, T, HV, K, device='cuda').sigmoid()
+        >>> beta = torch.rand(B, T, HV, device='cuda').sigmoid()
         >>> h0 = torch.randn(B, HV, K, V, device='cuda')
         >>> o, ht = fused_recurrent_kda(
             q, k, v, g, beta,

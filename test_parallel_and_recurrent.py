@@ -1,8 +1,6 @@
 import torch
 
-# from myfla import chunk_kda, fused_recurrent_kda
-from myfla.chunk_vecbeta import chunk_kda
-from myfla.fuesd_recurrent_vecbeta import fused_recurrent_kda
+from myfla import chunk_kda, fused_recurrent_kda
 
 
 def test_chunk_kda():
@@ -30,7 +28,7 @@ def test_chunk_kda():
                             cu_seqlens=None,
                             initial_t=0,
                             T_cycle=8,
-                            use_triton=False,
+                            use_triton=True,
                         )
     print(f"Parallel output shape: {o_parallel.shape}")
     print(f"Parallel output mean: {o_parallel.mean().item():.6f}")

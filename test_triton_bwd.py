@@ -1,8 +1,7 @@
 import torch
 import triton
 
-# from myfla import chunk_kda, fused_recurrent_kda
-from myfla.chunk_vecbeta import chunk_kda
+from myfla import chunk_kda, fused_recurrent_kda
 
 
 def _assert_close(name: str, a: torch.Tensor, b: torch.Tensor, rtol: float, atol: float):
@@ -178,7 +177,7 @@ def benchmark_chunk_kda_bwd_vs_T(
 
         loss.backward()
 
-    ms = triton.testing.do_bench(run, warmup=30, rep=200)
+    ms = triton.testing.do_bench(run)
     return ms
 
 
@@ -252,7 +251,7 @@ def benchmark_chunk_kda_bwd_vs_B(
 
         loss.backward()
 
-    ms = triton.testing.do_bench(run, warmup=30, rep=200)
+    ms = triton.testing.do_bench(run)
     return ms
 
 
@@ -325,7 +324,7 @@ def benchmark_chunk_kda_bwd_vs_KV(
 
         loss.backward()
 
-    ms = triton.testing.do_bench(run, warmup=30, rep=200)
+    ms = triton.testing.do_bench(run)
     return ms
 
 
@@ -333,6 +332,6 @@ if __name__ == "__main__":
     for seed in range(5):
         test_chunk_kda_bwd(T=120, dtype=torch.float16, include_state_in_loss=True, use_qk_l2norm_in_kernel=False, seed=seed)
 
-    # benchmark_chunk_kda_bwd_vs_T.run(save_path=".", print_data=False)
-    # benchmark_chunk_kda_bwd_vs_B.run(save_path=".", print_data=False)
+    benchmark_chunk_kda_bwd_vs_T.run(save_path=".", print_data=False)
+    benchmark_chunk_kda_bwd_vs_B.run(save_path=".", print_data=False)
     benchmark_chunk_kda_bwd_vs_KV.run(save_path=".", print_data=False)

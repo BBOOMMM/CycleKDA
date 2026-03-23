@@ -1,8 +1,7 @@
 import torch
 import triton
 
-# from myfla import chunk_kda, fused_recurrent_kda
-from myfla.chunk_vecbeta import chunk_kda
+from myfla import chunk_kda, fused_recurrent_kda
 
 
 def test_chunk_kda(seed):
@@ -188,7 +187,7 @@ def benchmark_chunk_kda_fwd_vs_B(T, provider, B, H, K, V, dtype, T_cycle, initia
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["K", "V"],
-        x_vals=[(32,32), (64, 64), (128,128), (256,256)],
+        x_vals=[(32,32), (64, 64), (128,128)],
         x_log=True,
         line_arg="provider",
         line_vals=["pytorch", "triton"],
@@ -239,6 +238,6 @@ def benchmark_chunk_kda_fwd_vs_KV(T, provider, B, H, K, V, dtype, T_cycle, initi
 if __name__ == "__main__":
     for seed in range(5):
         test_chunk_kda(seed)
-    benchmark_chunk_kda_fwd_vs_T.run(save_path='.', print_data=False)
-    benchmark_chunk_kda_fwd_vs_B.run(save_path='.', print_data=False)
+    # benchmark_chunk_kda_fwd_vs_T.run(save_path='.', print_data=False)
+    # benchmark_chunk_kda_fwd_vs_B.run(save_path='.', print_data=False)
     benchmark_chunk_kda_fwd_vs_KV.run(save_path='.', print_data=False)
