@@ -132,7 +132,7 @@ def causal_conv1d_fwd_kernel(
         b_y += b_residual
 
     p_y = tl.make_block_ptr(y + bos * D, (T, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-    tl.store(p_y, tl.cast(b_y, dtype=p_y.dtype.element_ty, fp_downcast_rounding='rtne'), boundary_check=(0, 1))
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.heuristics({
@@ -312,10 +312,10 @@ def causal_conv1d_bwd_kernel(
                 b_dh0_s = tl.sum(contrib, 0)
                 # dh0: [NT, B, D, W]
                 tl.store(dh0 + i_t * B * D * W + i_n * D * W + o_d * W + i_w,
-                         b_dh0_s.to(dh0.dtype.element_ty, fp_downcast_rounding='rtne'), mask=m_d)
+                         b_dh0_s.to(dh0.dtype.element_ty), mask=m_d)
 
     if HAS_BIAS:
-        b_db = tl.cast(b_db, dtype=db.dtype.element_ty, fp_downcast_rounding='rtne')
+        b_db = b_db.to(db.dtype.element_ty)
         tl.store(db + i_tg * D + o_d, b_db, mask=m_d)
 
     if USE_FINAL_STATE:
@@ -330,19 +330,13 @@ def causal_conv1d_bwd_kernel(
             b_dx += b_dht
 
     p_dx = tl.make_block_ptr(dx + bos * D, (T, D), (D, 1), (i_t * BT, i_d * BD), (BT, BD), (1, 0))
-    tl.store(p_dx, tl.cast(b_dx, dtype=p_dx.dtype.element_ty, fp_downcast_rounding='rtne'), boundary_check=(0, 1))
+    tl.store(p_dx, b_dx.to(p_dx.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics({
-    'USE_INITIAL_STATE': lambda args: args['cache'] is not None,
-    'HAS_WEIGHT': lambda args: args['weight'] is not None,
-    'HAS_BIAS': lambda args: args['bias'] is not None,
-    'HAS_RESIDUAL': lambda args: args['residual'] is not None,
-})
 @triton.jit
 def causal_conv1d_update_kernel(
     x,
-    cache,
+    conv_cache,
     residual,
     y,
     weight,
@@ -370,7 +364,7 @@ def causal_conv1d_update_kernel(
 
     if USE_INITIAL_STATE:
         # shift the cache by 1 with the last one being discarded
-        p_cache = tl.make_block_ptr(cache + i_n * D*W, (D, W), (W, 1), (i_d * BD, W - BW + 1), (BD, BW), (1, 0))
+        p_cache = tl.make_block_ptr(conv_cache + i_n * D*W, (D, W), (W, 1), (i_d * BD, W - BW + 1), (BD, BW), (1, 0))
         # [BD, BW]
         b_cache = tl.load(p_cache, boundary_check=(0, 1)).to(tl.float32)
         b_cache = tl.where(m_c[None, :], b_cache, b_x[:, None])
@@ -391,12 +385,12 @@ def causal_conv1d_update_kernel(
     if HAS_RESIDUAL:
         b_y += tl.load(residual + i_n * D + o_d, mask=m_d, other=0)
 
-    tl.store(y + i_n * D + o_d, tl.cast(b_y, dtype=y.dtype.element_ty, fp_downcast_rounding='rtne'), mask=m_d)
+    tl.store(y + i_n * D + o_d, b_y.to(y.dtype.element_ty), mask=m_d)
 
     if USE_INITIAL_STATE:
-        b_cache = tl.cast(b_cache, dtype=cache.dtype.element_ty, fp_downcast_rounding='rtne')
+        b_cache = b_cache.to(conv_cache.dtype.element_ty)
         # update the cache in-place
-        p_cache = tl.make_block_ptr(cache + i_n * D*W, (D, W), (W, 1), (i_d * BD, W - BW), (BD, BW), (1, 0))
+        p_cache = tl.make_block_ptr(conv_cache + i_n * D*W, (D, W), (W, 1), (i_d * BD, W - BW), (BD, BW), (1, 0))
         tl.store(p_cache, b_cache, boundary_check=(0, 1))
 
 
@@ -626,7 +620,7 @@ def causal_conv1d_update(
     def grid(meta): return (triton.cdiv(D, meta['BD']), N)
     causal_conv1d_update_kernel[grid](
         x=x,
-        cache=cache,
+        conv_cache=cache,
         residual=residual,
         y=y,
         weight=weight,
@@ -636,6 +630,10 @@ def causal_conv1d_update(
         BD=BD,
         BW=BW,
         ACTIVATION=activation,
+        USE_INITIAL_STATE=cache is not None,
+        HAS_WEIGHT=weight is not None,
+        HAS_BIAS=bias is not None,
+        HAS_RESIDUAL=residual is not None,
         num_warps=STATIC_WARPS,
     )
     return y.view(shape), cache

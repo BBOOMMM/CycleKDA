@@ -27,8 +27,12 @@ FLA_DISABLE_TENSOR_CACHE = os.getenv('FLA_DISABLE_TENSOR_CACHE', '0') == '1'
 
 
 SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters
+SUPPORTS_AUTOTUNE_CUDA_GRAPH = "use_cuda_graph" in inspect.signature(triton.autotune).parameters
 
 autotune_cache_kwargs = {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
+autotune_cuda_graph_kwargs = {
+    "use_cuda_graph": os.environ.get('FLA_USE_CUDA_GRAPH', '0') == '1'
+} if SUPPORTS_AUTOTUNE_CUDA_GRAPH else {}
 
 
 @lru_cache(maxsize=1)
@@ -362,14 +366,68 @@ def _cpu_device_warning():
     warnings.warn(('Triton is not supported on current platform, roll back to CPU.'), stacklevel=1)
 
 
+def _get_triton_driver():
+    runtime_driver = triton.runtime.driver
+    active_driver = getattr(runtime_driver, 'active', None)
+    if active_driver is not None:
+        return active_driver
+    lazy_driver = getattr(runtime_driver, 'driver', None)
+    if lazy_driver is not None:
+        return lazy_driver
+    # Triton 2.x may expose the lazy driver directly as `triton.runtime.driver`.
+    return runtime_driver
+
+
+def _get_triton_backend() -> str | None:
+    drv = _get_triton_driver()
+    if drv is None:
+        return None
+
+    # Triton >= 3.x
+    get_current_target = getattr(drv, 'get_current_target', None)
+    if callable(get_current_target):
+        target = get_current_target()
+        return getattr(target, 'backend', None)
+
+    # Triton 2.x
+    backend_id = getattr(drv, 'backend', None)
+    driver_base = getattr(triton.runtime.driver, 'DriverBase', None)
+    if driver_base is not None:
+        if backend_id == getattr(driver_base, 'CUDA', object()):
+            return 'cuda'
+        if backend_id == getattr(driver_base, 'HIP', object()):
+            return 'hip'
+    # Triton 2.x often exposes backend IDs directly: CUDA=0, HIP=1.
+    if backend_id == 0:
+        return 'cuda'
+    if backend_id == 1:
+        return 'hip'
+
+    return None
+
+
+def _get_triton_device_properties(tensor_idx: int = 0) -> dict | None:
+    drv = _get_triton_driver()
+    utils = getattr(drv, 'utils', None) if drv is not None else None
+    get_device_properties = getattr(utils, 'get_device_properties', None)
+    if not callable(get_device_properties):
+        return None
+    return get_device_properties(tensor_idx)
+
+
 @functools.cache
 def get_multiprocessor_count(tensor_idx: int = 0) -> int:
     try:
-        return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)['multiprocessor_count']
+        props = _get_triton_device_properties(tensor_idx)
+        if props is None:
+            return 1
+        return props['multiprocessor_count']
     except BaseException:
         # Maybe we use a NPU device.
-        if triton.runtime.driver.active.get_current_target().backend == 'npu':
-            return triton.runtime.driver.active.utils.get_device_properties(tensor_idx)['num_vectorcore']
+        if _get_triton_backend() == 'npu':
+            props = _get_triton_device_properties(tensor_idx)
+            if props is not None:
+                return props['num_vectorcore']
         else:
             return 1
 
@@ -377,7 +435,10 @@ def get_multiprocessor_count(tensor_idx: int = 0) -> int:
 @functools.cache
 def get_available_device() -> str:
     try:
-        return triton.runtime.driver.active.get_current_target().backend
+        backend = _get_triton_backend()
+        if backend is not None:
+            return backend
+        return 'cpu'
     except BaseException:
         _cpu_device_warning()
         return 'cpu'
@@ -427,10 +488,14 @@ if IS_TMA_SUPPORTED:
 
 def get_all_max_shared_mem():
     try:
-        return [
-            triton.runtime.driver.active.utils.get_device_properties(i)['max_shared_mem']
-            for i in range(device_torch_lib.device_count())
-        ]
+        max_shared_mem = []
+        for i in range(device_torch_lib.device_count()):
+            props = _get_triton_device_properties(i)
+            if props is None:
+                max_shared_mem.append(-1)
+            else:
+                max_shared_mem.append(props['max_shared_mem'])
+        return max_shared_mem
     except BaseException:
         _cpu_device_warning()
         return [-1]

@@ -7,7 +7,7 @@ from fla.ops.kda.gate import kda_gate_bwd, kda_gate_fwd
 from fla.ops.utils import chunk_local_cumsum
 from fla.ops.utils.constant import RCP_LN2
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
-from fla.utils import IS_NVIDIA_HOPPER, USE_CUDA_GRAPH, autotune_cache_kwargs
+from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, autotune_cuda_graph_kwargs
 
 from einops import rearrange
 
@@ -449,8 +449,8 @@ def chunk_kda_fwd(
         for num_stages in [1, 2]
     ],
     key=['H', 'K', 'V', 'C'],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
+    **autotune_cuda_graph_kwargs,
 )
 @triton.jit
 def chunk_kda_fwd_state_kernel(
@@ -539,8 +539,8 @@ def chunk_kda_fwd_state_kernel(
         for num_stages in[1, 2]
     ],
     key=['H', 'K', 'V', 'C'],
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
+    **autotune_cuda_graph_kwargs,
 )
 @triton.jit
 def chunk_kda_fwd_output_kernel(
@@ -748,8 +748,8 @@ def chunk_kda_bwd(
     ],
     key=['H', 'K', 'V', 'C'],
     reset_to_zero=['dq', 'dk', 'dg', 'dbeta'],   # 在测试每个配置前，将 output_ptr 指向的内存清零
-    use_cuda_graph=USE_CUDA_GRAPH,
     **autotune_cache_kwargs,
+    **autotune_cuda_graph_kwargs,
 )
 @triton.jit
 def chunk_kda_bwd_kernel(

@@ -96,7 +96,7 @@ def softplus2_nv(x):
 def softplus2_triton(x):
     return tl.where(x < 15.0, tl.math.log2(1 + tl.math.exp2(x)), x)
 
-if IS_NVIDIA:
+if IS_NVIDIA and hasattr(tl, 'inline_asm_elementwise'):
     softplus = softplus_nv
     softplus2 = softplus2_nv
 else:

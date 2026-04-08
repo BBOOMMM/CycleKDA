@@ -5,7 +5,6 @@ from einops import rearrange, repeat
 from collections.abc import Callable
 
 from fla.modules import FusedRMSNormGated, ShortConvolution
-# from fla.ops.kda import chunk_kda, fused_recurrent_kda
 from myfla import chunk_kda, fused_recurrent_kda
 from fla.ops.kda.gate import fused_kda_gate
 from fla.ops.utils.index import prepare_cu_seqlens_from_mask, prepare_lens_from_mask

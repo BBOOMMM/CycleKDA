@@ -4,20 +4,24 @@ import os
 
 import triton
 import triton.language as tl
-import triton.language.extra.libdevice as tldevice
+# import triton.language.extra.libdevice as tldevice    # cuda 11.8 版本不支持
 
 from fla.utils import IS_GATHER_SUPPORTED
 
-if os.environ.get('FLA_USE_FAST_OPS', '0') == '1':
-    exp = tldevice.fast_expf
-    exp2 = tldevice.exp2
-    log = tldevice.fast_logf
-    log2 = tldevice.fast_log2f
-else:
-    exp = tl.exp
-    exp2 = tl.math.exp2
-    log = tl.log
-    log2 = tl.log2
+# if os.environ.get('FLA_USE_FAST_OPS', '0') == '1':
+#     exp = tldevice.fast_expf
+#     exp2 = tldevice.exp2
+#     log = tldevice.fast_logf
+#     log2 = tldevice.fast_log2f
+# else:
+#     exp = tl.exp
+#     exp2 = tl.math.exp2
+#     log = tl.log
+#     log2 = tl.log2
+exp = tl.exp
+exp2 = tl.math.exp2 if hasattr(tl.math, 'exp2') else lambda x: exp(x * 1.4426950408889634)
+log = tl.log
+log2 = tl.log2 if hasattr(tl, 'log2') else lambda x: tl.log(x) / 0.6931471805599453
 
 
 if not IS_GATHER_SUPPORTED:
