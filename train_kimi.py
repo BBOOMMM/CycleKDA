@@ -75,6 +75,7 @@ def train():
     with open(cfg_path, "r", encoding="utf-8") as f:
         config = json.load(f)
     config["input_size"] = 1
+    config["output_size"] = 1
 
     config = KimiLinearConfig(**config)
     model = KimiLinearTimeModel(config).to(device).to(torch.bfloat16)

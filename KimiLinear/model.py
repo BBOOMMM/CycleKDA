@@ -162,7 +162,7 @@ class KimiLinearTimeModel(KimiPreTrainedModel):
             config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = KimiRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps)
-        self.output_proj = nn.Linear(config.hidden_size, config.input_size)
+        self.output_proj = nn.Linear(config.hidden_size, config.output_size)
 
         # if getattr(config, "_attn_implementation", None) is not None:
         #     if config._attn_implementation != "flash_attention_2":
