@@ -9,6 +9,7 @@ import torch.nn as nn
 from tqdm import tqdm 
 import matplotlib.pyplot as plt
 import math
+from load_data import split_data
 
 
 def set_seed():
@@ -36,12 +37,13 @@ def parse_args():
     parser.add_argument("--data-path", type=str, default="/mnt/nvme2/chenxuanyu/minv2_exp")
     parser.add_argument("--features-file", type=str, default="features.npy")
     parser.add_argument("--labels-file", type=str, default="labels.npy")
+    parser.add_argument("--indexes-file", type=str, default="index.h5")
     parser.add_argument("--mmap-mode", type=str, default="r")
     parser.add_argument(
         "--time-stride",
         type=int,
         default=3,
-        help="Baseline uses features[:, :, ::time_stride] and labels[:, :, ::time_stride]",
+        help="Baseline uses features[:, ::time_stride, :] and labels[:, ::time_stride, :]",
     )
     parser.add_argument(
         "--T_cycle",
@@ -55,30 +57,46 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--min_lr_ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--disable-data-parallel",
+        action="store_true",
+        help="Disable torch.nn.DataParallel even when multiple GPUs are visible.",
+    )
+    parser.add_argument(
+        "--device-ids",
+        type=str,
+        default="",
+        help="Comma-separated CUDA device ids for DataParallel, e.g. '0,1,2'. Empty means all visible devices.",
+    )
     return parser.parse_args()
 
 
-def load_data(args):
-    features_path = os.path.join(args.data_path, args.features_file)
-    labels_path = os.path.join(args.data_path, args.labels_file)
-
-    features = np.load(features_path, mmap_mode=args.mmap_mode)
-    labels = np.load(labels_path, mmap_mode=args.mmap_mode)
-    return features, labels
+def load_train_data(args):
+    features, labels, train_idx, test_idx = split_data(
+        data_path=args.data_path,
+        features_file=args.features_file,
+        labels_file=args.labels_file,
+        indexes_file=args.indexes_file,
+        mmap_mode=args.mmap_mode,
+        materialize=False,
+    )
+    return features, labels, train_idx, test_idx
 
 
 class BaselineDataset(Dataset):
-    def __init__(self, features, labels, time_stride=3):
+    def __init__(self, features, labels, time_stride=3, indices=None):
         self.features = features
         self.labels = labels
         self.time_stride = time_stride
+        self.indices = None if indices is None else np.asarray(indices, dtype=np.int64)
 
     def __len__(self):
-        return self.features.shape[0]
+        return self.features.shape[0] if self.indices is None else len(self.indices)
 
     def __getitem__(self, idx):
-        x = self.features[idx, ::self.time_stride, :]
-        y = self.labels[idx, ::self.time_stride, :]
+        real_idx = idx if self.indices is None else int(self.indices[idx])
+        x = self.features[real_idx, ::self.time_stride, :]
+        y = self.labels[real_idx, ::self.time_stride, :]
 
         return {
             "inputs": torch.from_numpy(np.array(x, dtype=np.float32, copy=True)),
@@ -86,11 +104,12 @@ class BaselineDataset(Dataset):
         }
 
 
-def build_dataloader(args, features, labels, shuffle=True):
+def build_dataloader(args, features, labels, indices=None, shuffle=True):
     dataset = BaselineDataset(
         features=features,
         labels=labels,
         time_stride=args.time_stride,
+        indices=indices,
     )
     return DataLoader(
         dataset,
@@ -111,11 +130,23 @@ def load_model(args, input_size, output_size):
     config.linear_attn_config["T_cycle"] = args.T_cycle
     
     model = KimiLinearTimeModel(config).to(DEVICE).to(MODEL_DTYPE)
+
+    if torch.cuda.is_available() and not args.disable_data_parallel:
+        if args.device_ids.strip():
+            device_ids = [int(x.strip()) for x in args.device_ids.split(",") if x.strip()]
+        else:
+            device_ids = list(range(torch.cuda.device_count()))
+
+        if len(device_ids) > 1:
+            model = nn.DataParallel(model, device_ids=device_ids)
+            print(f"Using DataParallel on GPUs: {device_ids}")
+
     model.train()
     
     def _count_params(model):
-        total = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        raw_model = model.module if isinstance(model, nn.DataParallel) else model
+        total = sum(p.numel() for p in raw_model.parameters())
+        trainable = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
         return total, trainable
     
     total, trainable = _count_params(model)
@@ -315,7 +346,8 @@ def train(args, model, dataloader):
     # save weights
     save_dir = os.path.join(os.path.dirname(__file__), "baseline_kimi_ckpt")
     os.makedirs(save_dir, exist_ok=True)
-    torch.save(model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    torch.save(raw_model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
 
 
 def main():
@@ -324,10 +356,11 @@ def main():
     
     print(f"device: {DEVICE}")
     
-    features, labels = load_data(args)
+    features, labels, train_idx, test_idx = load_train_data(args)
+    print(f"train samples: {len(train_idx)}, test samples: {len(test_idx)}")
     input_size = features.shape[-1]
     output_size = labels.shape[-1]
-    dataloader = build_dataloader(args, features, labels)
+    dataloader = build_dataloader(args, features, labels, indices=train_idx)
     
     model = load_model(args, input_size, output_size)
     

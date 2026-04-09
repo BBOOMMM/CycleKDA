@@ -390,28 +390,50 @@ def chunk_kda_fwd(
 
     BK = triton.next_power_of_2(K)
     grid_state = lambda META: (B * H, triton.cdiv(V, META['BV']))
-    
-    chunk_kda_fwd_state_kernel[grid_state](
-        k,
-        v,
-        g,
-        beta,
-        chunk_states,
-        initial_state,
-        final_state,
-        initial_t,
-        T_cycle,
-        N,
-        C,
-        B,
-        T,
-        H,
-        K,
-        V,
-        BK,
-        USE_INITIAL_STATE=(initial_state is not None),
-        STORE_FINAL_STATE=output_final_state,
-    )
+
+    if T_cycle == 1:
+        chunk_kda_fwd_state_kernel_t1[grid_state](
+            k,
+            v,
+            g,
+            beta,
+            chunk_states,
+            initial_state,
+            final_state,
+            initial_t,
+            N,
+            C,
+            B,
+            T,
+            H,
+            K,
+            V,
+            BK,
+            USE_INITIAL_STATE=(initial_state is not None),
+            STORE_FINAL_STATE=output_final_state,
+        )
+    else:
+        chunk_kda_fwd_state_kernel[grid_state](
+            k,
+            v,
+            g,
+            beta,
+            chunk_states,
+            initial_state,
+            final_state,
+            initial_t,
+            T_cycle,
+            N,
+            C,
+            B,
+            T,
+            H,
+            K,
+            V,
+            BK,
+            USE_INITIAL_STATE=(initial_state is not None),
+            STORE_FINAL_STATE=output_final_state,
+        )
 
     grid_output = lambda META: (N, B * H, triton.cdiv(V, META['BV']))
     chunk_kda_fwd_output_kernel[grid_output](
@@ -525,6 +547,111 @@ def chunk_kda_fwd_state_kernel(
             b_S = a_S - b_k[:, None] * k_a_S[None, :] + b_k[:, None] * u_v[None, :]
 
             j += T_cycle
+
+    if STORE_FINAL_STATE:
+        p_ht = final_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_ht, b_S, mask=mask_h)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BV in [16, 32, 64]
+        for num_warps in [2, 4, 8]
+        for num_stages in [1, 2]
+    ],
+    key=['H', 'K', 'V', 'C'],
+    **autotune_cache_kwargs,
+    **autotune_cuda_graph_kwargs,
+)
+@triton.jit
+def chunk_kda_fwd_state_kernel_t1(
+    k,              # [B, T, H, K]
+    v,              # [B, T, H, V]
+    g,              # [B, T, H, K]
+    beta,           # [B, T, H, K]
+    chunk_states,   # [B, H, N, K, V]
+    initial_state,  # [B, H, K, V]
+    final_state,
+    initial_t,
+    N: tl.constexpr,
+    C: tl.constexpr,
+    B: tl.constexpr,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    USE_INITIAL_STATE: tl.constexpr,
+    STORE_FINAL_STATE: tl.constexpr,
+    BV: tl.constexpr
+):
+    i_bh = tl.program_id(0)
+    i_v = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+
+    b_S = tl.zeros([BK, BV], dtype=tl.float32)
+    mask_h = (o_k < K)[:, None] & (o_v < V)[None, :]
+
+    if USE_INITIAL_STATE:
+        p_h0 = initial_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
+        b_S += tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
+
+    for i_n in range(N):
+        p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_cs, b_S, mask=mask_h)
+
+        start_t = initial_t + i_n * C
+        if start_t == 0:
+            for j in range(1, C):
+                token_idx = i_n * C + j
+                offset = i_b * T * H + token_idx * H + i_h
+
+                p_k = k + offset * K + o_k
+                p_v = v + offset * V + o_v
+                p_g = g + offset * K + o_k
+                p_b = beta + offset * K + o_k
+
+                mask_token = token_idx < T
+                mask_k = o_k < K
+                mask_v = o_v < V
+
+                u_k = tl.load(p_k, mask=mask_k & mask_token, other=0.0).to(tl.float32)
+                u_v = tl.load(p_v, mask=mask_v & mask_token, other=0.0).to(tl.float32)
+                u_alpha = tl.exp(tl.load(p_g, mask=mask_k & mask_token, other=0).to(tl.float32))
+                u_beta = tl.load(p_b, mask=mask_k & mask_token, other=0.0).to(tl.float32)
+
+                a_S = u_alpha[:, None] * b_S
+                k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
+                b_k = u_beta * u_k
+                b_S = a_S - b_k[:, None] * k_a_S[None, :] + b_k[:, None] * u_v[None, :]
+        else:
+            for j in range(C):
+                token_idx = i_n * C + j
+                offset = i_b * T * H + token_idx * H + i_h
+
+                p_k = k + offset * K + o_k
+                p_v = v + offset * V + o_v
+                p_g = g + offset * K + o_k
+                p_b = beta + offset * K + o_k
+
+                mask_token = token_idx < T
+                mask_k = o_k < K
+                mask_v = o_v < V
+
+                u_k = tl.load(p_k, mask=mask_k & mask_token, other=0.0).to(tl.float32)
+                u_v = tl.load(p_v, mask=mask_v & mask_token, other=0.0).to(tl.float32)
+                u_alpha = tl.exp(tl.load(p_g, mask=mask_k & mask_token, other=0).to(tl.float32))
+                u_beta = tl.load(p_b, mask=mask_k & mask_token, other=0.0).to(tl.float32)
+
+                a_S = u_alpha[:, None] * b_S
+                k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
+                b_k = u_beta * u_k
+                b_S = a_S - b_k[:, None] * k_a_S[None, :] + b_k[:, None] * u_v[None, :]
 
     if STORE_FINAL_STATE:
         p_ht = final_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
@@ -726,14 +853,24 @@ def chunk_kda_bwd(
 
     BK = triton.next_power_of_2(K)
     grid = lambda META: (B * H, triton.cdiv(V, META['BV']))
-    chunk_kda_bwd_kernel[grid](
-        q, k, v, g, beta, do, Aqk,
-        chunk_states, intra_states,
-        dq, dk, dv, dg, dbeta, dht, d_initial_state,
-        scale, initial_t, T_cycle, N, C, B, T, H, K, V, BK, M,
-        LOAD_FINAL_STATE=(dht is not None),
-        HAS_INITIAL_STATE=(initial_state is not None),
-    )
+    if T_cycle == 1:
+        chunk_kda_bwd_kernel_t1[grid](
+            q, k, v, g, beta, do, Aqk,
+            chunk_states, intra_states,
+            dq, dk, dv, dg, dbeta, dht, d_initial_state,
+            scale, initial_t, N, C, B, T, H, K, V, BK, M,
+            LOAD_FINAL_STATE=(dht is not None),
+            HAS_INITIAL_STATE=(initial_state is not None),
+        )
+    else:
+        chunk_kda_bwd_kernel[grid](
+            q, k, v, g, beta, do, Aqk,
+            chunk_states, intra_states,
+            dq, dk, dv, dg, dbeta, dht, d_initial_state,
+            scale, initial_t, T_cycle, N, C, B, T, H, K, V, BK, M,
+            LOAD_FINAL_STATE=(dht is not None),
+            HAS_INITIAL_STATE=(initial_state is not None),
+        )
     
     return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), dg.to(g.dtype), dbeta.to(beta.dtype), d_initial_state
 
@@ -974,6 +1111,291 @@ def chunk_kda_bwd_kernel(
         tl.atomic_add(p_dq, b_dq, mask=mask_tk)
         tl.atomic_add(p_dk, b_dk, mask=mask_tk)
         tl.store(p_dv, b_dv, mask=mask_tv)  # 各管各的 V 切片, 用 store
+        tl.atomic_add(p_dg, b_dg, mask=mask_tk)
+        tl.atomic_add(p_dbeta, b_dbeta, mask=mask_tk)
+
+    if HAS_INITIAL_STATE:
+        p_d_init = d_initial_state + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
+        tl.store(p_d_init, d_b_S, mask=mask_kv)
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        for BV in[16, 32, 64]
+        for num_warps in [2, 4, 8]
+        for num_stages in [1, 2]
+    ],
+    key=['H', 'K', 'V', 'C'],
+    reset_to_zero=['dq', 'dk', 'dg', 'dbeta'],
+    **autotune_cache_kwargs,
+    **autotune_cuda_graph_kwargs,
+)
+@triton.jit
+def chunk_kda_bwd_kernel_t1(
+    q, k, v, g, beta, do, Aqk,
+    chunk_states, intra_states,
+    dq, dk, dv, dg, dbeta, dht, d_initial_state,
+    scale, initial_t,
+    N: tl.constexpr,
+    C: tl.constexpr,
+    B: tl.constexpr,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    M: tl.constexpr,
+    LOAD_FINAL_STATE: tl.constexpr,
+    HAS_INITIAL_STATE: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_bh = tl.program_id(0)
+    i_v = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    o_c = tl.arange(0, C)
+
+    mask_kv = (o_k < K)[:, None] & (o_v < V)[None, :]
+
+    d_b_S = tl.zeros([BK, BV], dtype=tl.float32)
+    if LOAD_FINAL_STATE:
+        p_dht = dht + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
+        d_b_S = tl.load(p_dht, mask=mask_kv, other=0.0).to(tl.float32)
+
+    for i_n in range(N - 1, -1, -1):
+        t = i_n * C + o_c
+        mask_t = t < T
+        base_bth = i_b * T * H
+        base_tokens = base_bth + t[:, None] * H + i_h
+
+        p_q = q + base_tokens * K + o_k[None, :]
+        p_k = k + base_tokens * K + o_k[None, :]
+        p_v = v + base_tokens * V + o_v[None, :]
+        p_g = g + base_tokens * K + o_k[None, :]
+        p_b = beta + base_tokens * K + o_k[None, :]
+        p_do = do + base_tokens * V + o_v[None, :]
+        p_Aqk = Aqk + (base_bth + t * H + i_h)
+
+        mask_tk = mask_t[:, None] & (o_k < K)[None, :]
+        mask_tv = mask_t[:, None] & (o_v < V)[None, :]
+
+        b_q = tl.load(p_q, mask=mask_tk, other=0.0).to(tl.float32) * scale
+        b_k = tl.load(p_k, mask=mask_tk, other=0.0).to(tl.float32)
+        b_v = tl.load(p_v, mask=mask_tv, other=0.0).to(tl.float32)
+        b_g = tl.load(p_g, mask=mask_tk, other=-float("inf")).to(tl.float32)
+        b_beta = tl.load(p_b, mask=mask_tk, other=0.0).to(tl.float32)
+        b_do = tl.load(p_do, mask=mask_tv, other=0.0).to(tl.float32)
+        b_Aqk = tl.load(p_Aqk, mask=mask_t, other=0.0).to(tl.float32)
+        b_alpha = tl.exp(b_g)
+
+        b_dq = tl.zeros([C, BK], dtype=tl.float32)
+        b_dk = tl.zeros([C, BK], dtype=tl.float32)
+        b_dv = tl.zeros([C, BV], dtype=tl.float32)
+        b_dg = tl.zeros([C, BK], dtype=tl.float32)
+        b_dbeta = tl.zeros([C, BK], dtype=tl.float32)
+
+        start_t = initial_t + i_n * C
+
+        if start_t == 0:
+            if C == 1:
+                p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
+                b_S = tl.load(p_cs, mask=mask_kv, other=0.0).to(tl.float32)
+
+                mask_seg = mask_t
+                q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
+                k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
+                v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
+                a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
+                b_seg = tl.where(mask_seg[:, None], b_beta, 0.0)
+                do_seg = tl.where(mask_seg[:, None], b_do, 0.0)
+                c_seg_val = tl.where(mask_seg, b_Aqk, 0.0)
+
+                aq_seg = a_seg * q_seg
+                ak_seg = a_seg * k_seg
+                bk_seg = b_seg * k_seg
+                S_ak = tl.dot(ak_seg, b_S)
+
+                d_c_seg_val = tl.sum(do_seg * (v_seg - S_ak), axis=1)
+                d_S_ak = -c_seg_val[:, None] * do_seg
+
+                d_aq_seg = tl.dot(do_seg, tl.trans(b_S))
+                d_b_S_1 = tl.dot(tl.trans(aq_seg), do_seg)
+                d_ak_seg = tl.dot(d_S_ak, tl.trans(b_S))
+                d_b_S_2 = tl.dot(tl.trans(ak_seg), d_S_ak)
+
+                b_dq += (d_c_seg_val[:, None] * bk_seg + d_aq_seg * a_seg) * scale
+                b_dk += (d_c_seg_val[:, None] * q_seg * b_seg + d_ak_seg * a_seg)
+                b_dv += c_seg_val[:, None] * do_seg
+                b_dg += (d_aq_seg * q_seg + d_ak_seg * k_seg) * a_seg
+                b_dbeta += d_c_seg_val[:, None] * q_seg * k_seg
+
+                d_b_S += d_b_S_1 + d_b_S_2
+            else:
+                for j in range(C - 1, 0, -1):
+                    if j == 1:
+                        p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
+                        b_S = tl.load(p_cs, mask=mask_kv, other=0.0).to(tl.float32)
+                        prev_j = -1
+                    else:
+                        p_intra = intra_states + (i_bh * N + i_n) * M * K * V + (j - 2) * K * V + o_k[:, None] * V + o_v[None, :]
+                        b_S = tl.load(p_intra, mask=mask_kv, other=0.0).to(tl.float32)
+                        prev_j = j - 1
+
+                    mask_j = (o_c == j) & mask_t
+                    token_idx = i_n * C + j
+
+                    if token_idx < T:
+                        offset = base_bth + token_idx * H + i_h
+                        u_k = tl.load(k + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32)
+                        u_v = tl.load(v + offset * V + o_v, mask=(o_v < V), other=0.0).to(tl.float32)
+                        u_alpha = tl.exp(tl.load(g + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32))
+                        u_beta = tl.load(beta + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32)
+
+                        a_S = u_alpha[:, None] * b_S
+                        k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
+                        b_k_u = u_beta * u_k
+
+                        d_a_S = d_b_S + 0.0
+                        d_b_k_u = tl.sum(d_b_S * (u_v[None, :] - k_a_S[None, :]), axis=1)
+                        d_k_a_S = tl.sum(d_b_S * (-b_k_u[:, None]), axis=0)
+                        d_u_v = tl.sum(d_b_S * b_k_u[:, None], axis=0)
+
+                        d_u_k_1 = tl.sum(d_k_a_S[None, :] * a_S, axis=1)
+                        d_a_S += d_k_a_S[None, :] * u_k[:, None]
+
+                        d_u_beta = d_b_k_u * u_k
+                        d_u_k_2 = d_b_k_u * u_beta
+
+                        d_u_alpha = tl.sum(d_a_S * b_S, axis=1)
+                        d_b_S = d_a_S * u_alpha[:, None]
+
+                        d_u_k = d_u_k_1 + d_u_k_2
+                        d_u_g = d_u_alpha * u_alpha
+
+                        b_dk += tl.where(mask_j[:, None], d_u_k[None, :], 0.0)
+                        b_dv += tl.where(mask_j[:, None], d_u_v[None, :], 0.0)
+                        b_dg += tl.where(mask_j[:, None], d_u_g[None, :], 0.0)
+                        b_dbeta += tl.where(mask_j[:, None], d_u_beta[None, :], 0.0)
+
+                    mask_seg = (o_c > prev_j) & (o_c <= j) & mask_t
+                    q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
+                    k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
+                    v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
+                    a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
+                    b_seg = tl.where(mask_seg[:, None], b_beta, 0.0)
+                    do_seg = tl.where(mask_seg[:, None], b_do, 0.0)
+                    c_seg_val = tl.where(mask_seg, b_Aqk, 0.0)
+
+                    aq_seg = a_seg * q_seg
+                    ak_seg = a_seg * k_seg
+                    bk_seg = b_seg * k_seg
+                    S_ak = tl.dot(ak_seg, b_S)
+
+                    d_c_seg_val = tl.sum(do_seg * (v_seg - S_ak), axis=1)
+                    d_S_ak = -c_seg_val[:, None] * do_seg
+
+                    d_aq_seg = tl.dot(do_seg, tl.trans(b_S))
+                    d_b_S_1 = tl.dot(tl.trans(aq_seg), do_seg)
+                    d_ak_seg = tl.dot(d_S_ak, tl.trans(b_S))
+                    d_b_S_2 = tl.dot(tl.trans(ak_seg), d_S_ak)
+
+                    b_dq += (d_c_seg_val[:, None] * bk_seg + d_aq_seg * a_seg) * scale
+                    b_dk += (d_c_seg_val[:, None] * q_seg * b_seg + d_ak_seg * a_seg)
+                    b_dv += c_seg_val[:, None] * do_seg
+                    b_dg += (d_aq_seg * q_seg + d_ak_seg * k_seg) * a_seg
+                    b_dbeta += d_c_seg_val[:, None] * q_seg * k_seg
+
+                    d_b_S += d_b_S_1 + d_b_S_2
+        else:
+            for j in range(C - 1, -1, -1):
+                if j == 0:
+                    p_cs = chunk_states + (i_bh * N + i_n) * K * V + o_k[:, None] * V + o_v[None, :]
+                    b_S = tl.load(p_cs, mask=mask_kv, other=0.0).to(tl.float32)
+                    prev_j = -1
+                else:
+                    p_intra = intra_states + (i_bh * N + i_n) * M * K * V + (j - 1) * K * V + o_k[:, None] * V + o_v[None, :]
+                    b_S = tl.load(p_intra, mask=mask_kv, other=0.0).to(tl.float32)
+                    prev_j = j - 1
+
+                mask_j = (o_c == j) & mask_t
+                token_idx = i_n * C + j
+
+                if token_idx < T:
+                    offset = base_bth + token_idx * H + i_h
+                    u_k = tl.load(k + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32)
+                    u_v = tl.load(v + offset * V + o_v, mask=(o_v < V), other=0.0).to(tl.float32)
+                    u_alpha = tl.exp(tl.load(g + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32))
+                    u_beta = tl.load(beta + offset * K + o_k, mask=(o_k < K), other=0.0).to(tl.float32)
+
+                    a_S = u_alpha[:, None] * b_S
+                    k_a_S = tl.sum(u_k[:, None] * a_S, axis=0)
+                    b_k_u = u_beta * u_k
+
+                    d_a_S = d_b_S + 0.0
+                    d_b_k_u = tl.sum(d_b_S * (u_v[None, :] - k_a_S[None, :]), axis=1)
+                    d_k_a_S = tl.sum(d_b_S * (-b_k_u[:, None]), axis=0)
+                    d_u_v = tl.sum(d_b_S * b_k_u[:, None], axis=0)
+
+                    d_u_k_1 = tl.sum(d_k_a_S[None, :] * a_S, axis=1)
+                    d_a_S += d_k_a_S[None, :] * u_k[:, None]
+
+                    d_u_beta = d_b_k_u * u_k
+                    d_u_k_2 = d_b_k_u * u_beta
+
+                    d_u_alpha = tl.sum(d_a_S * b_S, axis=1)
+                    d_b_S = d_a_S * u_alpha[:, None]
+
+                    d_u_k = d_u_k_1 + d_u_k_2
+                    d_u_g = d_u_alpha * u_alpha
+
+                    b_dk += tl.where(mask_j[:, None], d_u_k[None, :], 0.0)
+                    b_dv += tl.where(mask_j[:, None], d_u_v[None, :], 0.0)
+                    b_dg += tl.where(mask_j[:, None], d_u_g[None, :], 0.0)
+                    b_dbeta += tl.where(mask_j[:, None], d_u_beta[None, :], 0.0)
+
+                mask_seg = (o_c > prev_j) & (o_c <= j) & mask_t
+                q_seg = tl.where(mask_seg[:, None], b_q, 0.0)
+                k_seg = tl.where(mask_seg[:, None], b_k, 0.0)
+                v_seg = tl.where(mask_seg[:, None], b_v, 0.0)
+                a_seg = tl.where(mask_seg[:, None], b_alpha, 0.0)
+                b_seg = tl.where(mask_seg[:, None], b_beta, 0.0)
+                do_seg = tl.where(mask_seg[:, None], b_do, 0.0)
+                c_seg_val = tl.where(mask_seg, b_Aqk, 0.0)
+
+                aq_seg = a_seg * q_seg
+                ak_seg = a_seg * k_seg
+                bk_seg = b_seg * k_seg
+                S_ak = tl.dot(ak_seg, b_S)
+
+                d_c_seg_val = tl.sum(do_seg * (v_seg - S_ak), axis=1)
+                d_S_ak = -c_seg_val[:, None] * do_seg
+
+                d_aq_seg = tl.dot(do_seg, tl.trans(b_S))
+                d_b_S_1 = tl.dot(tl.trans(aq_seg), do_seg)
+                d_ak_seg = tl.dot(d_S_ak, tl.trans(b_S))
+                d_b_S_2 = tl.dot(tl.trans(ak_seg), d_S_ak)
+
+                b_dq += (d_c_seg_val[:, None] * bk_seg + d_aq_seg * a_seg) * scale
+                b_dk += (d_c_seg_val[:, None] * q_seg * b_seg + d_ak_seg * a_seg)
+                b_dv += c_seg_val[:, None] * do_seg
+                b_dg += (d_aq_seg * q_seg + d_ak_seg * k_seg) * a_seg
+                b_dbeta += d_c_seg_val[:, None] * q_seg * k_seg
+
+                d_b_S += d_b_S_1 + d_b_S_2
+
+        p_dq = dq + base_tokens * K + o_k[None, :]
+        p_dk = dk + base_tokens * K + o_k[None, :]
+        p_dv = dv + base_tokens * V + o_v[None, :]
+        p_dg = dg + base_tokens * K + o_k[None, :]
+        p_dbeta = dbeta + base_tokens * K + o_k[None, :]
+
+        tl.atomic_add(p_dq, b_dq, mask=mask_tk)
+        tl.atomic_add(p_dk, b_dk, mask=mask_tk)
+        tl.store(p_dv, b_dv, mask=mask_tv)
         tl.atomic_add(p_dg, b_dg, mask=mask_tk)
         tl.atomic_add(p_dbeta, b_dbeta, mask=mask_tk)
 
