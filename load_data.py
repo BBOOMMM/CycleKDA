@@ -65,10 +65,39 @@ def split_data(
     return features, labels, train_idx, test_idx
 
 
+def analyze_indexes(data_path, indexes_file='index.h5'):
+    indexes_path = os.path.join(data_path, indexes_file)
+    indexes = pd.read_hdf(indexes_path)
+    indexes['datetime'] = pd.to_datetime(indexes['datetime'])
+
+    print(f'total rows: {len(indexes)}')
+    print(f'columns: {indexes.columns.tolist()}')
+    print(f'start datetime: {indexes["datetime"].min()}')
+    print(f'end datetime: {indexes["datetime"].max()}')
+    print()
+
+    # 1. 查看总共有多少个不同日期, 多少个不同股票
+    date_counts = indexes['datetime'].value_counts().sort_index()
+    print(f'unique dates: {len(date_counts)}')
+    code_counts = indexes['code'].value_counts().sort_index()
+    print(f'unique codes: {len(code_counts)}')
+    print()
+
+    # 2. 按日期分组，查看每天有多少张股票
+    daily_code_counts = indexes.groupby('datetime')['code'].count()   # .nunique() 计算每个日期的不同股票数量
+    print('daily code counts:')
+    print(daily_code_counts.describe())
+    daily_unique_code_counts = indexes.groupby('datetime')['code'].nunique()   # .nunique() 计算每个日期的不同股票数量
+    print('daily unique code counts:')
+    print(daily_unique_code_counts.describe())
+    # 两个一摸一样，按日期分组后，组内所有的股票都是不同的
+
+
 if __name__ == '__main__':
     data_path = '/mnt/nvme2/chenxuanyu/minv2_exp/'
-    features, labels, train_idx, test_idx = split_data(data_path)
-    print('--- split summary ---')
-    print(f'train rows: {len(train_idx)}')
-    print(f'test rows: {len(test_idx)}')
-    print('full features shape:', features.shape, 'full labels shape:', labels.shape)
+    # features, labels, train_idx, test_idx = split_data(data_path)
+    # print('--- split summary ---')
+    # print(f'train rows: {len(train_idx)}')
+    # print(f'test rows: {len(test_idx)}')
+    # print('full features shape:', features.shape, 'full labels shape:', labels.shape)
+    analyze_indexes(data_path)

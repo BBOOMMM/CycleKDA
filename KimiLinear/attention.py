@@ -101,7 +101,8 @@ class KimiDeltaAttention(nn.Module):
         use_cache = cache_params is not None
         batch_size, q_len, _ = hidden_states.shape
         # mode = 'fused_recurrent' if q_len <= 64 else self.mode
-        mode = "chunk" if self.training else "fused_recurrent"
+        # mode = "chunk" if self.training else "fused_recurrent"
+        mode = "chunk"
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
 
