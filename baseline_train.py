@@ -2,6 +2,7 @@ import numpy as np
 import os
 import torch
 import argparse
+import logging
 from torch.utils.data import DataLoader, Dataset
 import json
 from KimiLinear import KimiLinearConfig, KimiLinearTimeModel
@@ -9,7 +10,8 @@ import torch.nn as nn
 from tqdm import tqdm 
 import matplotlib.pyplot as plt
 import math
-from load_data import split_data
+from datetime import datetime
+from load_data import split_data, labels_normalize
 
 
 def set_seed():
@@ -30,6 +32,32 @@ def set_seed():
 set_seed()
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+
+def setup_logger():
+    log_dir = os.path.join(os.path.dirname(__file__), "log")
+    os.makedirs(log_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = os.path.join(log_dir, f"baseline_train_{timestamp}.log")
+
+    logger = logging.getLogger("baseline_train")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    logger.info(f"Log file: {log_path}")
+    return logger
 
 
 def parse_args():
@@ -80,6 +108,7 @@ def load_train_data(args):
         mmap_mode=args.mmap_mode,
         materialize=False,
     )
+    labels = labels_normalize(labels)
     return features, labels, train_idx, test_idx
 
 
@@ -120,7 +149,7 @@ def build_dataloader(args, features, labels, indices=None, shuffle=True):
     )
 
 
-def load_model(args, input_size, output_size):
+def load_model(args, input_size, output_size, logger):
     cfg_path = os.path.join(os.path.dirname(__file__), "configs/timekimi_config.json")
     with open(cfg_path, "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -139,7 +168,7 @@ def load_model(args, input_size, output_size):
 
         if len(device_ids) > 1:
             model = nn.DataParallel(model, device_ids=device_ids)
-            print(f"Using DataParallel on GPUs: {device_ids}")
+            logger.info(f"Using DataParallel on GPUs: {device_ids}")
 
     model.train()
     
@@ -150,8 +179,8 @@ def load_model(args, input_size, output_size):
         return total, trainable
     
     total, trainable = _count_params(model)
-    print(f"Total params: {total:,} ({total/1e6:.2f}M)")
-    print(f"Trainable params: {trainable:,} ({trainable/1e6:.2f}M)")
+    logger.info(f"Total params: {total:,} ({total/1e6:.2f}M)")
+    logger.info(f"Trainable params: {trainable:,} ({trainable/1e6:.2f}M)")
     
     return model
 
@@ -280,7 +309,7 @@ def plot_training_curves(output_dir, epoch_losses, epoch_ics, epoch_rank_ics, ep
     plt.close(fig)
 
 
-def train(args, model, dataloader):
+def train(args, model, dataloader, logger):
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler, total_steps, warmup_steps = build_scheduler(args, optimizer, len(dataloader))
@@ -291,7 +320,7 @@ def train(args, model, dataloader):
     epoch_rank_ics = []
     epoch_irs = []
     global_step = 0
-    print(f"total_steps={total_steps}, warmup_steps={warmup_steps}")
+    logger.info(f"total_steps={total_steps}, warmup_steps={warmup_steps}")
     
     for epoch in tqdm(range(args.epochs), desc="Epoch"):
         total_loss = 0.0
@@ -322,7 +351,7 @@ def train(args, model, dataloader):
 
             if global_step % every_log_steps == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
-                print(f"[epoch={epoch:03d} step={global_step:06d}] loss={float(loss.detach().cpu()):.6f} lr={current_lr:.6e}")
+                logger.info(f"[epoch={epoch:03d} step={global_step:06d}] loss={float(loss.detach().cpu()):.6f} lr={current_lr:.6e}")
 
         avg_epoch_loss = total_loss / max(1, len(dataloader))
         epoch_losses.append(avg_epoch_loss)
@@ -330,7 +359,7 @@ def train(args, model, dataloader):
         epoch_ics.append(mean_ic)
         epoch_rank_ics.append(mean_rank_ic)
         epoch_irs.append(ir)
-        print(
+        logger.info(
             f"[epoch={epoch:03d}] avg_loss={avg_epoch_loss:.6f} "
             f"IC={mean_ic:.6f} RankIC={mean_rank_ic:.6f} IR={ir:.6f}"
         )
@@ -353,18 +382,19 @@ def train(args, model, dataloader):
 def main():
     args = parse_args()
     assert args.T_cycle == 1
+    logger = setup_logger()
     
-    print(f"device: {DEVICE}")
+    logger.info(f"device: {DEVICE}")
     
     features, labels, train_idx, test_idx = load_train_data(args)
-    print(f"train samples: {len(train_idx)}, test samples: {len(test_idx)}")
+    logger.info(f"train samples: {len(train_idx)}, test samples: {len(test_idx)}")
     input_size = features.shape[-1]
     output_size = labels.shape[-1]
     dataloader = build_dataloader(args, features, labels, indices=train_idx)
     
-    model = load_model(args, input_size, output_size)
+    model = load_model(args, input_size, output_size, logger)
     
-    train(args, model, dataloader)
+    train(args, model, dataloader, logger)
 
 
 if __name__ == '__main__':

@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from KimiLinear import KimiLinearConfig, KimiLinearTimeModel
-from load_data import split_data
+from load_data import split_data, labels_normalize
 
 
 def set_seed():
@@ -63,7 +63,7 @@ def parse_args():
 	parser.add_argument("--ckpt-dir", type=str, default="CycleKDA_ckpt")
 	parser.add_argument("--weights-file", type=str, default="pytorch_model.bin")
 	parser.add_argument("--max-test-samples", type=int, default=0, help="0 means all test samples")
-	parser.add_argument("--output-dir", type=str, default="/home/chenxuanyu/code/CycleKDA/pred")
+	parser.add_argument("--output-dir", type=str, default="/home/chenxuanyu/code/CycleKDA/pred2")
 	parser.add_argument("--pred-out", type=str, default="cyclekda_test_pred.npy")
 	parser.add_argument("--metrics-out", type=str, default="cyclekda_test_metrics.json")
 	return parser.parse_args()
@@ -100,6 +100,7 @@ def evaluate_and_save(args):
 		mmap_mode=args.mmap_mode,
 		materialize=False,
 	)
+	# labels = labels_normalize(labels)   # 不需要
 
 	if args.max_test_samples > 0:
 		test_idx = test_idx[: args.max_test_samples]

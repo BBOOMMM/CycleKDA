@@ -5,7 +5,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from load_data import load_data, split_data
+from load_data import load_data, split_data, labels_normalize
 from tqdm import tqdm
 
 
@@ -53,8 +53,8 @@ def parse_args():
 	parser.add_argument("--labels-file", type=str, default="labels.npy")
 	parser.add_argument("--indexes-file", type=str, default="index.h5")
 	parser.add_argument("--mmap-mode", type=str, default="r")
-	parser.add_argument("--pred-path", type=str, default="/home/chenxuanyu/code/CycleKDA/pred/cyclekda_test_pred.npy")
-	parser.add_argument("--output-dir", type=str, default="/home/chenxuanyu/code/CycleKDA/pred/cyclekda")
+	parser.add_argument("--pred-path", type=str, default="/home/chenxuanyu/code/CycleKDA/pred2/cyclekda_test_pred.npy")
+	parser.add_argument("--output-dir", type=str, default="/home/chenxuanyu/code/CycleKDA/pred2/cyclekda")
 	parser.add_argument("--prefix", type=str, default="cyclekda")
 	parser.add_argument("--max-test-samples", type=int, default=0, help="0 means all test samples")
 	return parser.parse_args()
@@ -70,6 +70,7 @@ def main():
 		indexes_file=args.indexes_file,
 		mmap_mode=args.mmap_mode,
 	)
+	# labels = labels_normalize(labels)
 	_, _, _, test_idx = split_data(
 		data_path=args.data_path,
 		features_file=args.features_file,

@@ -1,23 +1,24 @@
-import numpy as np
-import os
-import torch
 import argparse
-import logging
-from torch.utils.data import DataLoader, Dataset
 import json
-from KimiLinear import KimiLinearConfig, KimiLinearTimeModel
-import torch.nn as nn
-from tqdm import tqdm 
-import matplotlib.pyplot as plt
+import logging
 import math
+import os
 from datetime import datetime
-from load_data import split_data, labels_normalize
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+from load_data import labels_normalize, split_data
 
 
 def set_seed():
     import random
-    import numpy as np
     from transformers import set_seed as hf_set_seed
+
     seed = 42
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
@@ -31,7 +32,7 @@ def set_seed():
 
 set_seed()
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+MODEL_DTYPE = torch.float32
 
 
 def setup_logger():
@@ -39,9 +40,9 @@ def setup_logger():
     os.makedirs(log_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(log_dir, f"CycleKDA_train_{timestamp}.log")
+    log_path = os.path.join(log_dir, f"lstm_train_{timestamp}.log")
 
-    logger = logging.getLogger("CycleKDA_train")
+    logger = logging.getLogger("lstm_train")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     logger.propagate = False
@@ -61,25 +62,22 @@ def setup_logger():
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="CycleKDA")
+    parser = argparse.ArgumentParser(description="LSTM baseline")
     parser.add_argument("--data-path", type=str, default="/mnt/nvme2/chenxuanyu/minv2_exp")
     parser.add_argument("--features-file", type=str, default="features.npy")
     parser.add_argument("--labels-file", type=str, default="labels.npy")
     parser.add_argument("--indexes-file", type=str, default="index.h5")
     parser.add_argument("--mmap-mode", type=str, default="r")
-    # parser.add_argument(
-    #     "--time-stride",
-    #     type=int,
-    #     default=3,
-    #     help="Baseline uses features[:, :, ::time_stride] and labels[:, :, ::time_stride]",
-    # )
     parser.add_argument(
-        "--T_cycle",
+        "--time-stride",
         type=int,
         default=3,
-        help="various values",
+        help="Use features[:, ::time_stride, :] and labels[:, ::time_stride, :]",
     )
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--num-layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--epochs", type=int, default=10)
@@ -112,10 +110,11 @@ def load_train_data(args):
     return features, labels, train_idx, test_idx
 
 
-class BaselineDataset(Dataset):
-    def __init__(self, features, labels, indices=None):
+class SequenceDataset(Dataset):
+    def __init__(self, features, labels, time_stride=3, indices=None):
         self.features = features
         self.labels = labels
+        self.time_stride = time_stride
         self.indices = None if indices is None else np.asarray(indices, dtype=np.int64)
 
     def __len__(self):
@@ -123,8 +122,8 @@ class BaselineDataset(Dataset):
 
     def __getitem__(self, idx):
         real_idx = idx if self.indices is None else int(self.indices[idx])
-        x = self.features[real_idx, :, :]
-        y = self.labels[real_idx, :, :]
+        x = self.features[real_idx, :: self.time_stride, :]
+        y = self.labels[real_idx, :: self.time_stride, :]
 
         return {
             "inputs": torch.from_numpy(np.array(x, dtype=np.float32, copy=True)),
@@ -133,9 +132,10 @@ class BaselineDataset(Dataset):
 
 
 def build_dataloader(args, features, labels, indices=None, shuffle=True):
-    dataset = BaselineDataset(
+    dataset = SequenceDataset(
         features=features,
         labels=labels,
+        time_stride=args.time_stride,
         indices=indices,
     )
     return DataLoader(
@@ -147,16 +147,33 @@ def build_dataloader(args, features, labels, indices=None, shuffle=True):
     )
 
 
+class LSTMTimeModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1, dropout=0.0):
+        super().__init__()
+        lstm_dropout = dropout if num_layers > 1 else 0.0
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=lstm_dropout,
+            batch_first=True,
+        )
+        self.head = nn.Linear(hidden_size, output_size)
+
+    def forward(self, inputs):
+        out, _ = self.lstm(inputs)
+        preds = self.head(out)
+        return preds
+
+
 def load_model(args, input_size, output_size, logger):
-    cfg_path = os.path.join(os.path.dirname(__file__), "configs/timekimi_config.json")
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    config["input_size"] = input_size
-    config["output_size"] = output_size
-    config = KimiLinearConfig(**config)
-    config.linear_attn_config["T_cycle"] = args.T_cycle
-    
-    model = KimiLinearTimeModel(config).to(DEVICE).to(MODEL_DTYPE)
+    model = LSTMTimeModel(
+        input_size=input_size,
+        hidden_size=args.hidden_size,
+        output_size=output_size,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+    ).to(DEVICE).to(MODEL_DTYPE)
 
     if torch.cuda.is_available() and not args.disable_data_parallel:
         if args.device_ids.strip():
@@ -169,17 +186,16 @@ def load_model(args, input_size, output_size, logger):
             logger.info(f"Using DataParallel on GPUs: {device_ids}")
 
     model.train()
-    
-    def _count_params(model):
-        raw_model = model.module if isinstance(model, nn.DataParallel) else model
+
+    def _count_params(m):
+        raw_model = m.module if isinstance(m, nn.DataParallel) else m
         total = sum(p.numel() for p in raw_model.parameters())
         trainable = sum(p.numel() for p in raw_model.parameters() if p.requires_grad)
         return total, trainable
-    
+
     total, trainable = _count_params(model)
-    logger.info(f"Total params: {total:,} ({total/1e6:.2f}M)")
-    logger.info(f"Trainable params: {trainable:,} ({trainable/1e6:.2f}M)")
-    
+    logger.info(f"Total params: {total:,} ({total / 1e6:.2f}M)")
+    logger.info(f"Trainable params: {trainable:,} ({trainable / 1e6:.2f}M)")
     return model
 
 
@@ -241,13 +257,13 @@ def evaluate_metrics(model, dataloader):
         batch = next(iter(dataloader))
         inputs = batch["inputs"].to(DEVICE, dtype=MODEL_DTYPE)
         labels = batch["labels"]
-        preds, _ = model(input_ids=inputs, use_cache=False)
+        preds = model(inputs)
 
     if model_was_training:
         model.train()
 
-    preds = preds.detach().to(torch.float32).cpu().numpy()   # [B, L, C]
-    labels = labels.to(torch.float32).cpu().numpy()          # [B, L, C]
+    preds = preds.detach().to(torch.float32).cpu().numpy()  # [B, L, C]
+    labels = labels.to(torch.float32).cpu().numpy()  # [B, L, C]
 
     ic_values = []
     rank_ic_values = []
@@ -256,7 +272,7 @@ def evaluate_metrics(model, dataloader):
 
     for t in range(seq_len):
         for c in range(output_size):
-            pred_tc = preds[:, t, c]    # 所有股票，某一个评价因子的取值
+            pred_tc = preds[:, t, c]
             label_tc = labels[:, t, c]
 
             ic = _pearson_corr_1d(pred_tc, label_tc)
@@ -303,7 +319,7 @@ def plot_training_curves(output_dir, epoch_losses, epoch_ics, epoch_rank_ics, ep
     axes[1, 1].set_ylabel("IR")
 
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, "train_metrics_overview.png"), dpi=150)
+    plt.savefig(os.path.join(output_dir, "lstm_train_metrics_overview.png"), dpi=150)
     plt.close(fig)
 
 
@@ -311,7 +327,7 @@ def train(args, model, dataloader, logger):
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler, total_steps, warmup_steps = build_scheduler(args, optimizer, len(dataloader))
-    
+
     every_log_steps = 10
     epoch_losses = []
     epoch_ics = []
@@ -319,7 +335,7 @@ def train(args, model, dataloader, logger):
     epoch_irs = []
     global_step = 0
     logger.info(f"total_steps={total_steps}, warmup_steps={warmup_steps}")
-    
+
     for epoch in tqdm(range(args.epochs), desc="Epoch"):
         total_loss = 0.0
 
@@ -328,18 +344,12 @@ def train(args, model, dataloader, logger):
             labels = batch["labels"].to(DEVICE, dtype=MODEL_DTYPE)
 
             optimizer.zero_grad()
-            
-            preds, _ = model(
-                input_ids=inputs,
-                use_cache=False,
-            )  # preds: [B, L, output_size]
-
+            preds = model(inputs)
             loss = criterion(preds.float(), labels.float())
-            
+
             loss.backward()
-            
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)   # 模型整体参数的梯度缩放
-            
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
             optimizer.step()
             if global_step + 1 < total_steps:
                 scheduler.step()
@@ -349,7 +359,10 @@ def train(args, model, dataloader, logger):
 
             if global_step % every_log_steps == 0:
                 current_lr = optimizer.param_groups[0]["lr"]
-                logger.info(f"[epoch={epoch:03d} step={global_step:06d}] loss={float(loss.detach().cpu()):.6f} lr={current_lr:.6e}")
+                logger.info(
+                    f"[epoch={epoch:03d} step={global_step:06d}] "
+                    f"loss={float(loss.detach().cpu()):.6f} lr={current_lr:.6e}"
+                )
 
         avg_epoch_loss = total_loss / max(1, len(dataloader))
         epoch_losses.append(avg_epoch_loss)
@@ -370,29 +383,30 @@ def train(args, model, dataloader, logger):
         epoch_irs=epoch_irs,
     )
 
-    # save weights
-    save_dir = os.path.join(os.path.dirname(__file__), "CycleKDA_ckpt")
+    save_dir = os.path.join(os.path.dirname(__file__), "lstm_ckpt")
     os.makedirs(save_dir, exist_ok=True)
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     torch.save(raw_model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
+
+    with open(os.path.join(save_dir, "train_args.json"), "w", encoding="utf-8") as f:
+        json.dump(vars(args), f, ensure_ascii=False, indent=2)
 
 
 def main():
     args = parse_args()
     logger = setup_logger()
-    
+
     logger.info(f"device: {DEVICE}")
-    
+
     features, labels, train_idx, test_idx = load_train_data(args)
     logger.info(f"train samples: {len(train_idx)}, test samples: {len(test_idx)}")
     input_size = features.shape[-1]
     output_size = labels.shape[-1]
     dataloader = build_dataloader(args, features, labels, indices=train_idx)
-    
+
     model = load_model(args, input_size, output_size, logger)
-    
     train(args, model, dataloader, logger)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
