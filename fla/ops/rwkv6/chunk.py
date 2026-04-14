@@ -15,6 +15,7 @@ from fla.utils import (
     autocast_custom_bwd,
     autocast_custom_fwd,
     autotune_cache_kwargs,
+    autotune_cuda_graph_kwargs,
     check_shared_mem,
     input_guard,
 )
@@ -34,7 +35,8 @@ BV_LIST = [32, 64] if check_shared_mem() else [16, 32]
         for num_stages in [2, 3, 4]
     ],
     key=['S', 'BT'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -71,8 +73,8 @@ def chunk_rwkv6_fwd_cumsum_kernel(
     b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
     b_oi = tl.dot(m_i, b_s)
     b_oe = tl.dot(m_e, b_s)
-    tl.store(p_oi, b_oi.to(p_oi.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.store(p_oe, b_oe.to(p_oe.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+    tl.store(p_oi, b_oi.to(p_oi.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_oe, b_oe.to(p_oe.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_rwkv6_fwd_cumsum(
@@ -113,7 +115,8 @@ def chunk_rwkv6_fwd_cumsum(
         for num_stages in [2, 3, 4]
     ],
     key=['BC'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -189,7 +192,8 @@ def chunk_rwkv6_fwd_A_kernel_intra_sub_inter(
         for num_warps in [1, 2, 4, 8]
     ],
     key=['BK', 'BT'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -264,7 +268,8 @@ def chunk_rwkv6_fwd_A_kernel_intra_sub_intra(
         triton.Config({}, num_warps=8),
     ],
     key=['BC', 'BK'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -345,7 +350,8 @@ def chunk_rwkv6_fwd_A_kernel_intra_sub_intra_split(
         triton.Config({}, num_warps=8),
     ],
     key=['BC'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -398,7 +404,8 @@ def chunk_rwkv6_fwd_A_kernel_intra_sub_intra_merge(
         for num_stages in [2, 3, 4]
     ],
     key=['BT'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -479,7 +486,8 @@ def chunk_rwkv6_bwd_kernel_dh(
         for num_warps in [1, 2, 4, 8]
     ],
     key=['BK', 'NC', 'BT'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -620,7 +628,8 @@ def chunk_rwkv6_bwd_kernel_intra(
         for num_warps in [2, 4, 8]
     ],
     key=['BT'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])

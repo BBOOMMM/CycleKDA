@@ -34,12 +34,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
 
-def setup_logger():
+def setup_logger(args):
     log_dir = os.path.join(os.path.dirname(__file__), "log")
     os.makedirs(log_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = os.path.join(log_dir, f"baseline_train_{timestamp}.log")
+    log_path = os.path.join(log_dir, f"{args.attn_type}_train_{timestamp}.log")
 
     logger = logging.getLogger("baseline_train")
     logger.setLevel(logging.INFO)
@@ -79,6 +79,7 @@ def parse_args():
         default=1,
         help="Baseline must use T_cycle==1",
     )
+    parser.add_argument("--attn_type", type=str, default="rwkv7")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
@@ -108,7 +109,7 @@ def load_train_data(args):
         mmap_mode=args.mmap_mode,
         materialize=False,
     )
-    labels = labels_normalize(labels)
+    # labels = labels_normalize(labels)
     return features, labels, train_idx, test_idx
 
 
@@ -155,6 +156,7 @@ def load_model(args, input_size, output_size, logger):
         config = json.load(f)
     config["input_size"] = input_size
     config["output_size"] = output_size
+    config["attn_type"] = args.attn_type
     config = KimiLinearConfig(**config)
     config.linear_attn_config["T_cycle"] = args.T_cycle
     
@@ -373,7 +375,7 @@ def train(args, model, dataloader, logger):
     )
 
     # save weights
-    save_dir = os.path.join(os.path.dirname(__file__), "baseline_kimi_ckpt")
+    save_dir = os.path.join(os.path.dirname(__file__), f"{args.attn_type}_ckpt")
     os.makedirs(save_dir, exist_ok=True)
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
     torch.save(raw_model.state_dict(), os.path.join(save_dir, "pytorch_model.bin"))
@@ -382,7 +384,7 @@ def train(args, model, dataloader, logger):
 def main():
     args = parse_args()
     assert args.T_cycle == 1
-    logger = setup_logger()
+    logger = setup_logger(args)
     
     logger.info(f"device: {DEVICE}")
     

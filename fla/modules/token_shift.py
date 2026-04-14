@@ -386,6 +386,11 @@ def token_shift_fwd(
     else:
         cache_out = None
 
+    # Triton autotune/kernel wrappers can be fragile with None pointer arguments.
+    # Always pass valid tensors to kernels and guard actual reads/writes via constexpr flags.
+    cache_kernel = cache if cache is not None else torch.empty((N, D), device=x.device, dtype=x.dtype)
+    cache_out_kernel = cache_out if cache_out is not None else torch.empty((N, D), device=x.device, dtype=x.dtype)
+
     if use_short_kernel:
         if cu_seqlens is not None:
             N = len(cu_seqlens) - 1
@@ -395,12 +400,12 @@ def token_shift_fwd(
         grid = (N, T)
         IS_DECODE = T == 1 or (B == 1 and T == N)
         token_shift_fwd_kernel_short[grid](
-            x=x,
-            y=y,
-            cu_seqlens=cu_seqlens,
-            cache=cache,
-            cache_out=cache_out,
-            T=T,
+            x,
+            y,
+            cu_seqlens,
+            cache_kernel,
+            cache_out_kernel,
+            T,
             D=D,
             BD=BD,
             STORE_FINAL_STATE=output_cache,
@@ -421,8 +426,8 @@ def token_shift_fwd(
             y,
             cu_seqlens,
             chunk_indices,
-            cache,
-            cache_out,
+            cache_kernel,
+            cache_out_kernel,
             T,
             D=D,
             BD=BD,

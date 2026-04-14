@@ -6,7 +6,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import gather
-from fla.utils import IS_GATHER_SUPPORTED, USE_CUDA_GRAPH, autotune_cache_kwargs
+from fla.utils import IS_GATHER_SUPPORTED, USE_CUDA_GRAPH, autotune_cache_kwargs, autotune_cuda_graph_kwargs
 
 
 @triton.heuristics({
@@ -18,7 +18,8 @@ from fla.utils import IS_GATHER_SUPPORTED, USE_CUDA_GRAPH, autotune_cache_kwargs
         for num_warps in [1, 2, 4, 8, 16]
     ],
     key=['BT'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -64,7 +65,8 @@ def prepare_wy_repr_fwd_kernel_chunk32(
         for num_stages in [2, 3, 4]
     ],
     key=['BC'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -127,9 +129,9 @@ def prepare_wy_repr_fwd_kernel_chunk64(
     b_A2 += tl.arange(0, BC)[:, None] == tl.arange(0, BC)[None, :]
     b_A3 = tl.dot(tl.dot(b_A2, b_A3), b_A)
     # tl.debug_barrier()
-    tl.store(p_A_inv1, b_A.to(p_A_inv1.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.store(p_A_inv2, b_A2.to(p_A_inv2.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.store(p_A_inv3, b_A3.to(p_A_inv3.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+    tl.store(p_A_inv1, b_A.to(p_A_inv1.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_A_inv2, b_A2.to(p_A_inv2.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_A_inv3, b_A3.to(p_A_inv3.dtype.element_ty), boundary_check=(0, 1))
     # causal mask
     tl.store(p_A_inv4, tl.zeros([BC, BC], dtype=tl.float32).to(p_A_inv4.dtype.element_ty), boundary_check=(0, 1))
 
@@ -144,7 +146,8 @@ def prepare_wy_repr_fwd_kernel_chunk64(
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -186,22 +189,22 @@ def wu_fwd_kernel(
     # let's use tf32 here
     b_Aak = tl.dot(b_Aab_inv, b_Aak)
     # (SY 01/04) should be bf16 or tf32? To verify.
-    b_Aak = b_Aak.to(v.dtype.element_ty, fp_downcast_rounding="rtne")
-    b_Aab_inv = b_Aab_inv.to(ag.dtype.element_ty, fp_downcast_rounding="rtne")
+    b_Aak = b_Aak.to(v.dtype.element_ty)
+    b_Aab_inv = b_Aab_inv.to(ag.dtype.element_ty)
 
     for i_k in range(tl.cdiv(K, BK)):
         p_ag = tl.make_block_ptr(ag + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         p_w = tl.make_block_ptr(w + (bos*H + i_h) * K, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
         b_ag = tl.load(p_ag, boundary_check=(0, 1))
         b_w = tl.dot(b_Aab_inv, b_ag)  # both bf16 or fp16
-        tl.store(p_w, b_w.to(p_w.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
     for i_v in range(tl.cdiv(V, BV)):
         p_v = tl.make_block_ptr(v + (bos*H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         p_u = tl.make_block_ptr(u + (bos*H + i_h) * V, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
         b_v = tl.load(p_v, boundary_check=(0, 1))
         b_u = tl.dot(b_Aak, b_v)  # both bf16 or fp16
-        tl.store(p_u, b_u.to(p_u.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
 
 
 def wu_fwd(

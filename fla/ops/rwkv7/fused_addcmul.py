@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 from packaging.version import Version
 
-from fla.utils import IS_AMD, USE_CUDA_GRAPH, autotune_cache_kwargs, check_pytorch_version, input_guard
+from fla.utils import IS_AMD, USE_CUDA_GRAPH, autotune_cache_kwargs, autotune_cuda_graph_kwargs, check_pytorch_version, input_guard
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +41,9 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
         for num_stages in [1, 2, 3]
         for BT in [2, 4, 8]
     ],
-    key=['BD'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    key=['T'],
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -76,11 +77,11 @@ def fused_addcmul_fwd_kernel(
     b_v = tl.load(ixv + o_d, mask=m_d)
     b_a = tl.load(ixa + o_d, mask=m_d)
 
-    o_r = tl.fma(b_x, b_r, b_h)
-    o_w = tl.fma(b_x, b_w, b_h)
-    o_k = tl.fma(b_x, b_k, b_h)
-    o_v = tl.fma(b_x, b_v, b_h)
-    o_a = tl.fma(b_x, b_a, b_h)
+    o_r = b_x * b_r + b_h
+    o_w = b_x * b_w + b_h
+    o_k = b_x * b_k + b_h
+    o_v = b_x * b_v + b_h
+    o_a = b_x * b_a + b_h
 
     tl.store(oxr + off_vec, o_r.to(oxr.dtype.element_ty), mask=mask)
     tl.store(oxw + off_vec, o_w.to(oxw.dtype.element_ty), mask=mask)
@@ -90,7 +91,7 @@ def fused_addcmul_fwd_kernel(
 
     if use_xg:
         b_g = tl.load(ixg + o_d, mask=m_d)
-        o_g = tl.fma(b_x, b_g, b_h)
+        o_g = b_x * b_g + b_h
         tl.store(oxg + off_vec, o_g.to(oxg.dtype.element_ty), mask=mask)
 
 
@@ -101,8 +102,9 @@ def fused_addcmul_fwd_kernel(
         for num_stages in [1, 2, 3]
         for BT in [2, 4, 8]
     ],
-    key=['BD'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    key=['T'],
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit

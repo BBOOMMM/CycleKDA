@@ -53,9 +53,9 @@ def parse_args():
 	parser.add_argument("--labels-file", type=str, default="labels.npy")
 	parser.add_argument("--indexes-file", type=str, default="index.h5")
 	parser.add_argument("--mmap-mode", type=str, default="r")
-	parser.add_argument("--pred-path", type=str, default="/home/chenxuanyu/code/CycleKDA/pred2/cyclekda_test_pred.npy")
-	parser.add_argument("--output-dir", type=str, default="/home/chenxuanyu/code/CycleKDA/pred2/cyclekda")
-	parser.add_argument("--prefix", type=str, default="cyclekda")
+	parser.add_argument("--pred-path", type=str, default="/home/chenxuanyu/code/CycleKDA/pred2/lstm_test_pred.npy")
+	parser.add_argument("--output-dir", type=str, default="/home/chenxuanyu/code/CycleKDA/pred2/lstm")
+	parser.add_argument("--prefix", type=str, default="lstm")
 	parser.add_argument("--max-test-samples", type=int, default=0, help="0 means all test samples")
 	return parser.parse_args()
 

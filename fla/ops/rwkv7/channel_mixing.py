@@ -11,6 +11,7 @@ from fla.utils import (
     autocast_custom_bwd,
     autocast_custom_fwd,
     autotune_cache_kwargs,
+    autotune_cuda_graph_kwargs,
     check_pytorch_version,
     input_guard,
 )
@@ -27,7 +28,8 @@ if not check_pytorch_version('2.4'):
         for block_size in [128, 256, 512, 1024, 2048, 4096, 8192]
     ],
     key=['hidden_dim'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -71,7 +73,7 @@ def rwkv_seq_mix_kernel(
     prev_value = tl.where(is_first, prev_state, prev_x)
     state_diff = prev_value - curr_x
     mixed = state_diff * k_value
-    result = tl.cast(curr_x + mixed, dtype=output_ptr.dtype.element_ty, fp_downcast_rounding='rtne')
+    result = tl.cast(curr_x + mixed, dtype=output_ptr.dtype.element_ty)
     tl.store(output_ptr + x_idx, result, mask=is_valid)
 
 
@@ -87,7 +89,7 @@ def rwkv_channel_mixing_pow_and_relu(
     x0 = xindex
     x = tl.load(in_ptr + (x0), None)
     x = tl.maximum(x, 0.0).to(tl.float32)
-    x = tl.cast(x * x, dtype=out_ptr.dtype.element_ty, fp_downcast_rounding='rtne')
+    x = tl.cast(x * x, dtype=out_ptr.dtype.element_ty)
     tl.store(out_ptr + (x0), x, None)
 
 
@@ -194,7 +196,8 @@ def relu_square_bwd_kernel(
         for block_size in [128, 256, 512, 1024, 2048, 4096, 8192]
     ],
     key=['hidden_dim'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -227,7 +230,7 @@ def rwkv_mix_bwd_kenel(
     dk1_next = tl.load(dk1_ptr0 + next_offset, mask=mask_next & is_valid, other=0.0)
     prod_next = dk1_next * xk
     dx_val = dk1 - prod + tl.where(mask_next, prod_next, 0.0)
-    dx_val = tl.cast(dx_val, dtype=dx_ptr.dtype.element_ty, fp_downcast_rounding='rtne')
+    dx_val = tl.cast(dx_val, dtype=dx_ptr.dtype.element_ty)
     tl.store(dx_ptr + offsets, dx_val, mask=is_valid)
 
     dx_prev_offset = batch_idx * hidden_dim + feat_idx

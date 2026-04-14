@@ -18,8 +18,16 @@ class KimiDecoderLayer(nn.Module):
         
         if config.is_kda_layer(layer_idx):
             self.is_linear_attn = True
-            self.self_attn = KimiDeltaAttention(
-                config=config, layer_idx=layer_idx)
+            if config.attn_type == "cyclekda":
+                self.self_attn = KimiDeltaAttention(config=config, layer_idx=layer_idx)
+            elif config.attn_type == "kda":
+                assert config.linear_attn_config["T_cycle"] == 1, "KimiLinearTimeModel only supports T_cycle=1 for baseline kda."
+                self.self_attn = KimiDeltaAttention(config=config, layer_idx=layer_idx)
+            elif config.attn_type == "rwkv7":
+                from .attn.rwkv7_attn import RWKV7Attention
+                self.self_attn = RWKV7Attention(config=config, layer_idx=layer_idx)
+            else:
+                raise ValueError(f"Unsupported attn_type: {config.attn_type}")
         elif config.is_mla:
             self.is_linear_attn = False
             self.self_attn = KimiMLAAttention(

@@ -6,7 +6,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 from fla.ops.utils.op import exp
-from fla.utils import IS_AMD, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_AMD, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem, autotune_cuda_graph_kwargs
 
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
 
@@ -23,7 +23,8 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
         for num_stages in [2, 3, 4]
     ],
     key=['BT', 'BK', 'BV'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -101,7 +102,7 @@ def chunk_dplr_fwd_kernel_h(
 
     if STORE_FINAL_STATE:
         p_ht = tl.make_block_ptr(ht + i_nh * K*V, (K, V), (V, 1), (i_k * BK, i_v * BV), (BK, BV), (1, 0))
-        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+        tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_dplr_fwd_h(

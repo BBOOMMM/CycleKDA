@@ -8,7 +8,7 @@ import triton.language as tl
 
 from fla.ops.generalized_delta_rule import fused_recurrent_dplr_delta_rule
 from fla.ops.utils.op import exp
-from fla.utils import USE_CUDA_GRAPH, autotune_cache_kwargs, input_guard
+from fla.utils import USE_CUDA_GRAPH, autotune_cache_kwargs, autotune_cuda_graph_kwargs, input_guard
 
 
 @triton.heuristics({
@@ -24,7 +24,8 @@ from fla.utils import USE_CUDA_GRAPH, autotune_cache_kwargs, input_guard
         for num_stages in [2, 3, 4]
     ],
     key=['BK'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])

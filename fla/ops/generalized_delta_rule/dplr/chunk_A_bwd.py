@@ -6,7 +6,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp, gather
-from fla.utils import IS_AMD, IS_GATHER_SUPPORTED, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_AMD, IS_GATHER_SUPPORTED, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem, autotune_cuda_graph_kwargs
 
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
 
@@ -21,7 +21,8 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
         for num_stages in [2, 3, 4]
     ],
     key=['BK', 'BT', 'K'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -227,7 +228,8 @@ def chunk_dplr_bwd_kernel_intra(
         for BK in [32, 64]
     ],
     key=['BK', 'BT', 'K'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])

@@ -19,15 +19,15 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 from einops import rearrange
-from torch.distributed import DeviceMesh
+# from torch.distributed import DeviceMesh
 # from torch.distributed.tensor import Replicate, Shard, distribute_module
-try:
-    # Newer PyTorch
-    from torch.distributed.tensor import Replicate, Shard, distribute_module
-except Exception:
-    # Some versions place placements here
-    from torch.distributed.tensor import distribute_module
-    from torch.distributed.tensor.placement_types import Replicate, Shard
+# try:
+#     # Newer PyTorch
+#     from torch.distributed.tensor import Replicate, Shard, distribute_module
+# except Exception:
+#     # Some versions place placements here
+#     from torch.distributed.tensor import distribute_module
+#     from torch.distributed.tensor.placement_types import Replicate, Shard
 from torch.distributed.tensor.parallel import ParallelStyle
 
 from fla.utils import autotune_cache_kwargs, get_multiprocessor_count, input_guard

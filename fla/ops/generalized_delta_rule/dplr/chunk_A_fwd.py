@@ -6,7 +6,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp, gather
-from fla.utils import IS_AMD, IS_GATHER_SUPPORTED, USE_CUDA_GRAPH, autotune_cache_kwargs
+from fla.utils import IS_AMD, IS_GATHER_SUPPORTED, USE_CUDA_GRAPH, autotune_cache_kwargs, autotune_cuda_graph_kwargs
 
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
 
@@ -21,7 +21,8 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
         for num_stages in [2, 3, 4]
     ],
     key=['BK', 'BT'],
-    use_cuda_graph=USE_CUDA_GRAPH,
+    # use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cuda_graph_kwargs,
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
@@ -98,10 +99,10 @@ def chunk_dplr_fwd_A_kernel_intra_sub_intra(
     b_kg = b_k * g_exp_inv
     b_bg = b_b * g_exp_inv
     b_ag = b_a * exp(b_ge)
-    tl.store(p_qg, b_qg.to(p_qg.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.store(p_bg, b_bg.to(p_bg.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.store(p_ag, b_ag.to(p_ag.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-    tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+    tl.store(p_qg, b_qg.to(p_qg.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_bg, b_bg.to(p_bg.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_ag, b_ag.to(p_ag.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
     # tl.debug_barrier()
 
     b_q = b_q.to(b_k.dtype)
@@ -132,10 +133,10 @@ def chunk_dplr_fwd_A_kernel_intra_sub_intra(
         b_A_ab = tl.sum(b_a * b_b_j * tmp2, 1)
         b_A_ab = b_A_ab * m_i2
 
-        tl.store(Aqk + o_A + j, b_A_qk.to(dtype=Aqk.dtype.element_ty, fp_downcast_rounding="rtne"), mask=m_A)
-        tl.store(Aqb + o_A + j, b_A_qb.to(dtype=Aqb.dtype.element_ty, fp_downcast_rounding="rtne"), mask=m_A)
-        tl.store(Aab + o_A + j, b_A_ab.to(dtype=Aqb.dtype.element_ty, fp_downcast_rounding="rtne"), mask=m_A)
-        tl.store(Aak + o_A + j, b_A_ak.to(dtype=Aqk.dtype.element_ty, fp_downcast_rounding="rtne"), mask=m_A)
+        tl.store(Aqk + o_A + j, b_A_qk.to(dtype=Aqk.dtype.element_ty), mask=m_A)
+        tl.store(Aqb + o_A + j, b_A_qb.to(dtype=Aqb.dtype.element_ty), mask=m_A)
+        tl.store(Aab + o_A + j, b_A_ab.to(dtype=Aqb.dtype.element_ty), mask=m_A)
+        tl.store(Aak + o_A + j, b_A_ak.to(dtype=Aqk.dtype.element_ty), mask=m_A)
 
 
 def chunk_dplr_fwd_intra(
