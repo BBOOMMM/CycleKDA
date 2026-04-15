@@ -59,7 +59,7 @@ def chunk_local_cumsum_scalar_kernel(
     b_o = tl.cumsum(b_s, axis=0)
     if REVERSE:
         b_z = tl.sum(b_s, axis=0)
-        b_o = -b_o + b_z[None] + b_s
+        b_o = -b_o + b_z + b_s
     if HAS_SCALE:
         b_o *= scale
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0,))

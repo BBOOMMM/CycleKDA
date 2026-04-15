@@ -79,7 +79,7 @@ def parse_args():
         default=1,
         help="Baseline must use T_cycle==1",
     )
-    parser.add_argument("--attn_type", type=str, default="rwkv7")
+    parser.add_argument("--attn_type", type=str, default="gated_deltanet", choices=["kda", "cyclekda", "gated_deltanet", "gla"])
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
@@ -109,7 +109,7 @@ def load_train_data(args):
         mmap_mode=args.mmap_mode,
         materialize=False,
     )
-    # labels = labels_normalize(labels)
+    labels = labels_normalize(labels)
     return features, labels, train_idx, test_idx
 
 
@@ -382,9 +382,13 @@ def train(args, model, dataloader, logger):
 
 
 def main():
+    global MODEL_DTYPE
     args = parse_args()
     assert args.T_cycle == 1
     logger = setup_logger(args)
+    if args.attn_type == "gated_deltanet" and MODEL_DTYPE == torch.bfloat16:
+        logger.warning("Using gated_deltanet with bfloat16 may lead to triton 2.1.0 bug, transfering to float32")
+        MODEL_DTYPE = torch.float32
     
     logger.info(f"device: {DEVICE}")
     

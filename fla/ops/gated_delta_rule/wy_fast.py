@@ -1,5 +1,4 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
 import torch
 import triton
 import triton.language as tl
@@ -201,12 +200,49 @@ def prepare_wy_repr_bwd_kernel(
         b_db += tl.sum(b_dvb * b_v, 1)
         tl.store(p_dv, b_dv.to(p_dv.dtype.element_ty), boundary_check=(0, 1))
 
+    # o_t = i_t * BT + tl.arange(0, BT)
+    # m_t = o_t < T
+    # m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
+    # b_dA = tl.where(m_A, b_dA, 0.0)
+    # b_dA = b_dA.to(b_A.dtype)
+    # b_dA = tl.dot(b_dA, b_A)
+    # b_dA = b_dA.to(b_A.dtype)
+    # b_dA = tl.dot(b_A, b_dA)
+
+
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
+    # m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
+    
+    # # 1. 关键修复：将 b_A 提升为 FP32，所有计算在 FP32 内完成
+    # b_A_fp32 = b_A.to(tl.float32)
+    
+    # # 2. 应用 Mask (b_dA 已经是 fp32，0.0 也是 fp32，完美匹配)
+    # b_dA = tl.where(m_A, b_dA, 0.0)
+    
+    # # 3. 执行矩阵乘法，全程使用 FP32
+    # # 注意：这里不再有任何 .to(b_A.dtype) 的中间转换
+    # b_dA = tl.dot(b_dA, b_A_fp32)
+    # b_dA = tl.dot(b_A_fp32, b_dA)
+
+
     m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
-    b_dA = tl.where(m_A, b_dA, 0)
-    b_dA = tl.dot(b_dA.to(b_A.dtype), b_A)
-    b_dA = tl.dot(b_A, b_dA.to(b_A.dtype))
+    
+    # 1. 将 b_A 转为 FP32
+    b_A_fp32 = b_A.to(tl.float32)
+    
+    # --- 修改点：用乘法代替 tl.where ---
+    # 将布尔掩码转为 FP32 (0.0 或 1.0)，然后直接相乘
+    mask_fp32 = m_A.to(tl.float32)
+    b_dA = b_dA * mask_fp32 
+    
+    # 2. 全程 FP32 矩阵乘法
+    b_dA = tl.dot(b_dA, b_A_fp32)
+    b_dA = tl.dot(b_A_fp32, b_dA)
+
+
+
+
 
     if USE_G:
         b_dA *= exp(b_g[:, None] - b_g[None, :])

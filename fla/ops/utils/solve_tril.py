@@ -78,9 +78,9 @@ def solve_tril_16x16_kernel(
     b_A += m_I
     if not USE_TMA:
         p_Ai = tl.make_block_ptr(Ai, (T, 16), (H*16, 1), (i_t * 16, 0), (16, 16), (1, 0))
-        tl.store(p_Ai, b_A.to(p_Ai.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+        tl.store(p_Ai, b_A.to(p_Ai.dtype.element_ty), boundary_check=(0, 1))
     else:
-        desc_o.store([i_t * 16, 0], b_A.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+        desc_o.store([i_t * 16, 0], b_A.to(desc_o.dtype))
 
 
 @triton.heuristics({
@@ -157,19 +157,19 @@ def merge_16x16_to_32x32_inverse_kernel(
     else:
         b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
 
-    b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21, input_precision=DOT_PRECISION), b_Ai_11, input_precision=DOT_PRECISION)
+    b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21), b_Ai_11)
 
     if not USE_TMA:
         p_Ai_11 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT, 0), (16, 16), (1, 0))
         p_Ai_21 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 16, 0), (16, 16), (1, 0))
         p_Ai_22 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 16, 16), (16, 16), (1, 0))
-        tl.store(p_Ai_11, b_Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_22, b_Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_21, b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+        tl.store(p_Ai_11, b_Ai_11.to(p_Ai_11.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_22, b_Ai_22.to(p_Ai_22.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_21, b_Ai_21.to(p_Ai_21.dtype.element_ty), boundary_check=(0, 1))
     else:
-        desc_o.store([i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 16, 0], b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+        desc_o.store([i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 16, 0], b_Ai_21.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype))
 
 
 @triton.heuristics({
@@ -282,28 +282,25 @@ def merge_16x16_to_64x64_inverse_kernel(
         b_A_42 = desc.load([i_t * BT + 48, 16]).to(tl.float32)
         b_A_43 = desc.load([i_t * BT + 48, 32]).to(tl.float32)
 
-    b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21, input_precision=DOT_PRECISION), b_Ai_11, input_precision=DOT_PRECISION)
-    b_Ai_32 = -tl.dot(tl.dot(b_Ai_33, b_A_32, input_precision=DOT_PRECISION), b_Ai_22, input_precision=DOT_PRECISION)
-    b_Ai_43 = -tl.dot(tl.dot(b_Ai_44, b_A_43, input_precision=DOT_PRECISION), b_Ai_33, input_precision=DOT_PRECISION)
+    b_Ai_21 = -tl.dot(tl.dot(b_Ai_22, b_A_21), b_Ai_11)
+    b_Ai_32 = -tl.dot(tl.dot(b_Ai_33, b_A_32), b_Ai_22)
+    b_Ai_43 = -tl.dot(tl.dot(b_Ai_44, b_A_43), b_Ai_33)
 
     b_Ai_31 = -tl.dot(
         b_Ai_33,
-        tl.dot(b_A_31, b_Ai_11, input_precision=DOT_PRECISION) +
-        tl.dot(b_A_32, b_Ai_21, input_precision=DOT_PRECISION),
-        input_precision=DOT_PRECISION,
+        tl.dot(b_A_31, b_Ai_11) +
+        tl.dot(b_A_32, b_Ai_21),
     )
     b_Ai_42 = -tl.dot(
         b_Ai_44,
-        tl.dot(b_A_42, b_Ai_22, input_precision=DOT_PRECISION) +
-        tl.dot(b_A_43, b_Ai_32, input_precision=DOT_PRECISION),
-        input_precision=DOT_PRECISION,
+        tl.dot(b_A_42, b_Ai_22) +
+        tl.dot(b_A_43, b_Ai_32),
     )
     b_Ai_41 = -tl.dot(
         b_Ai_44,
-        tl.dot(b_A_41, b_Ai_11, input_precision=DOT_PRECISION) +
-        tl.dot(b_A_42, b_Ai_21, input_precision=DOT_PRECISION) +
-        tl.dot(b_A_43, b_Ai_31, input_precision=DOT_PRECISION),
-        input_precision=DOT_PRECISION,
+        tl.dot(b_A_41, b_Ai_11) +
+        tl.dot(b_A_42, b_Ai_21) +
+        tl.dot(b_A_43, b_Ai_31),
     )
 
     if not USE_TMA:
@@ -317,27 +314,27 @@ def merge_16x16_to_64x64_inverse_kernel(
         p_Ai_41 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 48, 0), (16, 16), (1, 0))
         p_Ai_42 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 48, 16), (16, 16), (1, 0))
         p_Ai_43 = tl.make_block_ptr(Ai, (T, BT), (H*BT, 1), (i_t * BT + 48, 32), (16, 16), (1, 0))
-        tl.store(p_Ai_11, b_Ai_11.to(p_Ai_11.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_22, b_Ai_22.to(p_Ai_22.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_33, b_Ai_33.to(p_Ai_33.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_44, b_Ai_44.to(p_Ai_44.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_21, b_Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_31, b_Ai_31.to(p_Ai_31.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_32, b_Ai_32.to(p_Ai_32.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_41, b_Ai_41.to(p_Ai_41.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_42, b_Ai_42.to(p_Ai_42.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
-        tl.store(p_Ai_43, b_Ai_43.to(p_Ai_43.dtype.element_ty, fp_downcast_rounding="rtne"), boundary_check=(0, 1))
+        tl.store(p_Ai_11, b_Ai_11.to(p_Ai_11.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_22, b_Ai_22.to(p_Ai_22.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_33, b_Ai_33.to(p_Ai_33.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_44, b_Ai_44.to(p_Ai_44.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_21, b_Ai_21.to(p_Ai_21.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_31, b_Ai_31.to(p_Ai_31.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_32, b_Ai_32.to(p_Ai_32.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_41, b_Ai_41.to(p_Ai_41.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_42, b_Ai_42.to(p_Ai_42.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(p_Ai_43, b_Ai_43.to(p_Ai_43.dtype.element_ty), boundary_check=(0, 1))
     else:
-        desc_o.store([i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 32, 32], b_Ai_33.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 48, 48], b_Ai_44.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 16, 0], b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 32, 0], b_Ai_31.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 32, 16], b_Ai_32.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 48, 0], b_Ai_41.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 48, 16], b_Ai_42.to(desc_o.dtype, fp_downcast_rounding="rtne"))
-        desc_o.store([i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne"))
+        desc_o.store([i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 32, 32], b_Ai_33.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 48, 48], b_Ai_44.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 16, 0], b_Ai_21.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 32, 0], b_Ai_31.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 32, 16], b_Ai_32.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 48, 0], b_Ai_41.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 48, 16], b_Ai_42.to(desc_o.dtype))
+        desc_o.store([i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype))
 
 
 @input_guard

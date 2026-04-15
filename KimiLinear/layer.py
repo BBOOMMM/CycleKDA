@@ -23,7 +23,10 @@ class KimiDecoderLayer(nn.Module):
             elif config.attn_type == "kda":
                 assert config.linear_attn_config["T_cycle"] == 1, "KimiLinearTimeModel only supports T_cycle=1 for baseline kda."
                 self.self_attn = KimiDeltaAttention(config=config, layer_idx=layer_idx)
-            elif config.attn_type == "rwkv7":
+            elif config.attn_type == "gated_deltanet":
+                from .attn.gated_deltanet_attn import GatedDeltaNet
+                self.self_attn = GatedDeltaNet(config=config, layer_idx=layer_idx)
+            elif config.attn_type == "gla":
                 from .attn.rwkv7_attn import RWKV7Attention
                 self.self_attn = RWKV7Attention(config=config, layer_idx=layer_idx)
             else:
