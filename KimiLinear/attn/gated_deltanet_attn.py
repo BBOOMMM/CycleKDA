@@ -38,7 +38,7 @@ class GatedDeltaNet(nn.Module):
         self,
         config: KimiLinearConfig,
         layer_idx: int,
-        expand_v: float = 2,
+        expand_v: float = 1,
         num_v_heads: int = None,
         mode: str = 'chunk',
         use_gate: bool = True,

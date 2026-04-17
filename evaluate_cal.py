@@ -19,7 +19,7 @@ def parse_args():
 	parser.add_argument(
 		"--targets",
 		type=str,
-		default="lstm",
+		default="gla",
 		help="Comma-separated evaluation folder names under pred-root.",
 	)
 	parser.add_argument(

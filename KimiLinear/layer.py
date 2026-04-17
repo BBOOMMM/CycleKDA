@@ -27,8 +27,8 @@ class KimiDecoderLayer(nn.Module):
                 from .attn.gated_deltanet_attn import GatedDeltaNet
                 self.self_attn = GatedDeltaNet(config=config, layer_idx=layer_idx)
             elif config.attn_type == "gla":
-                from .attn.rwkv7_attn import RWKV7Attention
-                self.self_attn = RWKV7Attention(config=config, layer_idx=layer_idx)
+                from .attn.gla_attn import GatedLinearAttention
+                self.self_attn = GatedLinearAttention(config=config, layer_idx=layer_idx)
             else:
                 raise ValueError(f"Unsupported attn_type: {config.attn_type}")
         elif config.is_mla:

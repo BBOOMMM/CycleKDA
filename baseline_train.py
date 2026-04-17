@@ -386,7 +386,8 @@ def main():
     args = parse_args()
     assert args.T_cycle == 1
     logger = setup_logger(args)
-    if args.attn_type == "gated_deltanet" and MODEL_DTYPE == torch.bfloat16:
+    # if (args.attn_type == "gated_deltanet" or args.attn_type == "gla") and MODEL_DTYPE == torch.bfloat16:
+    if (args.attn_type == "gated_deltanet") and MODEL_DTYPE == torch.bfloat16:
         logger.warning("Using gated_deltanet with bfloat16 may lead to triton 2.1.0 bug, transfering to float32")
         MODEL_DTYPE = torch.float32
     

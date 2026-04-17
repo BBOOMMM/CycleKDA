@@ -10,6 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from KimiLinear.configuration import KimiLinearConfig
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
 from fla.modules.activations import ACT2FN
@@ -22,63 +23,16 @@ if TYPE_CHECKING:
 
 
 class GatedLinearAttention(nn.Module):
-    r"""
-    The layer implementaion for [Gated Linear Attention Transformers with Hardware-Efficient Training](https://arxiv.org/abs/2312.06635).  # noqa
-
-    Args:
-        mode (str, Optional):
-            Which GLA kernel to use.
-            Currently available: `chunk`, `fused_recurrent`, and `fused_chunk`.
-            Default: `chunk`.
-        hidden_size (int, Optional):
-            The hidden size of the input. Default: 1024.
-        expand_k (float, Optional):
-            The expansion ratio for the key dim. Default: 0.5.
-        expand_v (float, Optional):
-            The expansion ratio for the value dim. Default: 1.0.
-        num_heads (int, Optional):
-            The number of heads. Default: 4.
-        num_kv_heads (int, Optional):
-            The number of key/value heads, used for MQA. Default: None.
-        feature_map (str, Optional):
-            Feature map function applied to queries/keys. Default: None.
-        use_short_conv (bool, Optional):
-            Whether to use short convolutions. Default: `False`.
-        conv_size (int, Optional):
-            The kernel size of the short convolution, only used when `use_short_conv` is `True`. Default: 4.
-        conv_bias (bool, Optional):
-            Whether to use bias in the short convolution, only used when `use_short_conv` is `True`. Default: `False`.
-        use_output_gate (bool, Optional):
-            Whether to use output gate. Default: `True`.
-        gate_fn (str, Optional):
-            The activation function for the output gate. Default: `swish`.
-        elementwise_affine (bool, Optional):
-            If `True`, applies elementwise affine to LayerNorm with learnable parameters. Default: `True`.
-        norm_eps (float, Optional):
-            The epsilon value for the layernorm/rmsnorm layer. Default: 1e-5.
-        gate_logit_normalizer (int, Optional):
-            The normalizer for the gate logits, appied after `logsigmoid`. Default: 16.
-        gate_low_rank_dim (int, Optional):
-            The low rank dim for the gate projection. Default: 16.
-        clamp_min (float, Optional):
-            The minimum value for the gate logits. Default: None.
-        fuse_norm (bool, Optional):
-            Whether to fuse the norm and the output gate for better memory footprint. Default: `True`.
-        layer_idx (int, Optional):
-            The index of the layer. Default: None.
-    """
-
     def __init__(
         self,
+        config: KimiLinearConfig,
+        layer_idx: int,
         mode: str = 'chunk',
-        hidden_size: int = 1024,
-        expand_k: float = 0.5,
+        expand_k: float = 1.0,
         expand_v: float = 1.0,
-        num_heads: int = 4,
         num_kv_heads: int | None = None,
         feature_map: str | None = None,
-        use_short_conv: bool = False,
-        conv_size: int = 4,
+        use_short_conv: bool = True,
         conv_bias: bool = False,
         use_output_gate: bool = True,
         gate_fn: str = 'swish',
@@ -88,9 +42,12 @@ class GatedLinearAttention(nn.Module):
         gate_low_rank_dim: int = 16,
         clamp_min: float | None = None,
         fuse_norm: bool = True,
-        layer_idx: int = None,
     ) -> GatedLinearAttention:
         super().__init__()
+
+        hidden_size = config.hidden_size
+        num_heads = config.linear_attn_config["num_heads"]
+        conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
         self.mode = mode
         self.hidden_size = hidden_size
@@ -187,7 +144,8 @@ class GatedLinearAttention(nn.Module):
             )
 
         batch_size, q_len, _ = hidden_states.shape
-        mode = 'fused_recurrent' if hidden_states.shape[1] <= 64 else self.mode
+        # mode = 'fused_recurrent' if hidden_states.shape[1] <= 64 else self.mode
+        mode = "chunk"
 
         last_state = None
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
@@ -297,4 +255,4 @@ class GatedLinearAttention(nn.Module):
         if attention_mask is not None:
             o = pad_input(o.squeeze(0), indices, batch_size, q_len)
 
-        return o, None, past_key_values
+        return o

@@ -60,13 +60,14 @@ def parse_args():
     parser.add_argument("--mmap-mode", type=str, default="r")
     parser.add_argument("--time-stride", type=int, default=3)
     parser.add_argument("--T_cycle", type=int, default=1)
+    parser.add_argument("--attn_type", type=str, default="gla", choices=["kda", "cyclekda", "gated_deltanet", "gla"])
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--ckpt-dir", type=str, default="baseline_kimi_ckpt")
+    parser.add_argument("--ckpt-dir", type=str, default="gla_ckpt")
     parser.add_argument("--weights-file", type=str, default="pytorch_model.bin")
     parser.add_argument("--max-test-samples", type=int, default=0, help="0 means all test samples")
     parser.add_argument("--output-dir", type=str, default="/home/chenxuanyu/code/CycleKDA/pred2", help="Directory for inference outputs.")
-    parser.add_argument("--pred-out", type=str, default="baseline_test_pred.npy")
+    parser.add_argument("--pred-out", type=str, default="gla_test_pred.npy")
     return parser.parse_args()
 
 
@@ -77,6 +78,7 @@ def load_model(args, input_size, output_size):
 
     cfg_json["input_size"] = input_size
     cfg_json["output_size"] = output_size
+    cfg_json["attn_type"] = args.attn_type
     config = KimiLinearConfig(**cfg_json)
     config.linear_attn_config["T_cycle"] = args.T_cycle
 
@@ -166,8 +168,11 @@ def evaluate_and_save(args):
 
 
 def main():
+    global MODEL_DTYPE
     args = parse_args()
     assert args.T_cycle == 1, "baseline inference expects T_cycle == 1"
+    if (args.attn_type == "gated_deltanet") and MODEL_DTYPE == torch.bfloat16:
+        MODEL_DTYPE = torch.float32
     evaluate_and_save(args)
 
 

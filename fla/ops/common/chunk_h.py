@@ -19,11 +19,12 @@ BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
 })
 @triton.autotune(
     configs=[
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        # triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({'BK': BK, 'BV': BV})
         for BK in BKV_LIST
         for BV in BKV_LIST
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
+        # for num_warps in [1, 2, 4, 8]
+        # for num_stages in [1, 2]
     ],
     key=['BT', 'USE_G', 'USE_GK', 'USE_GV'],
     **autotune_cache_kwargs,
@@ -58,15 +59,20 @@ def chunk_fwd_kernel_h(
     IS_VARLEN: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_h = i_nh // H, i_nh % H
+    i_n = i_nh // H
+    i_h = i_nh % H
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
-        NT, NS = tl.cdiv(T, BT), tl.cdiv(T, BS)
+        NT = tl.cdiv(T, BT)
+        NS = tl.cdiv(T, BS)
         boh = tl.load(split_offsets + i_n).to(tl.int32)
     else:
-        bos, eos = i_n * T, i_n * T + T
-        NT, NS = tl.cdiv(T, BT), tl.cdiv(T, BS)
+        bos = i_n * T
+        eos = i_n * T + T
+        NT = tl.cdiv(T, BT)
+        NS = tl.cdiv(T, BS)
         boh = i_n * NS
     NTS = BS // BT
 
@@ -146,11 +152,12 @@ def chunk_fwd_kernel_h(
 })
 @triton.autotune(
     configs=[
-        triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        # triton.Config({'BK': BK, 'BV': BV}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({'BK': BK, 'BV': BV})
         for BK in BKV_LIST
         for BV in BKV_LIST
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
+        # for num_warps in [1, 2, 4, 8]
+        # for num_stages in [2, 3, 4]
     ],
     key=['BT', 'USE_G', 'USE_GK', 'USE_GV'],
     **autotune_cache_kwargs,
@@ -188,16 +195,19 @@ def chunk_bwd_kernel_dh(
     IS_VARLEN: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    i_n, i_hq = i_nh // HQ, i_nh % HQ
+    i_n = i_nh // HQ
+    i_hq = i_nh % HQ
     i_h = i_hq // NG
     if IS_VARLEN:
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+        bos = tl.load(cu_seqlens + i_n).to(tl.int32)
+        eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
         NT = tl.cdiv(T, BT)
         NS = tl.cdiv(T, BS)
         boh = tl.load(split_offsets + i_n).to(tl.int32)
     else:
-        bos, eos = i_n * T, i_n * T + T
+        bos = i_n * T
+        eos = i_n * T + T
         NT = tl.cdiv(T, BT)
         NS = tl.cdiv(T, BS)
         boh = i_n * NS
