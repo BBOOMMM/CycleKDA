@@ -1,5 +1,40 @@
-### CycleKDA
+# CycleKDA
 
-feature和label, 这个数据是一个长度是237的数据扩到711的，所以在你的哪个setting里就是3步step一次，你可以先取x[::3]训练一个baseline, 然后repeat 3次，再和你的方法做对比。评价指标是ic,rank ic和ir, 里面有个index.h5是date x code的格式， 评价的时候就是你产生了某一天全部股票的预测，比如是5000x711的矩阵， 然后你和label每一个时间步算一个相关系数，算了711遍，然后取平均得到今天的评价指标。
+## Kimi Linear
 
-baseline: features[:, ::3, :], labels[:, ::3, :]
+$$\begin{aligned}\mathbf{S}_t&=\left(\mathbf{I}-\beta_t \boldsymbol{k}_t \boldsymbol{k}_t^\top\right)\mathrm{Diag}(\boldsymbol{\alpha}_t)\mathbf{S}_{t-1}+\beta_t \boldsymbol{k}_t \boldsymbol{v}_t^\top\in \mathbb{R}^{d_k \times d_v};
+\\
+\boldsymbol{o}_t&=\mathbf{S}_t^\top \boldsymbol{q}_t\in \mathbb{R}^{d_v}.\end{aligned}$$
+
+## CycleKDA
+
+$$\begin{aligned}\rho_t&=\begin{cases}\dfrac{t \bmod T}{T}, & t \bmod T \neq 0 \\
+1, & t \bmod T = 0\end{cases}\\
+\mathbf{S}'_t&=\left(\mathbf{I}-
+\rho_t
+(\boldsymbol{\beta}_t \odot \boldsymbol{k}_t)
+\boldsymbol{k}_t^\top
+\right)
+\mathrm{Diag}(\boldsymbol{\alpha}_t)
+\mathbf{S}_{t-1}
++
+\rho_t
+(\boldsymbol{\beta}_t \odot \boldsymbol{k}_t)
+\boldsymbol{v}_t^\top ;
+\\
+\mathbf{S}_t
+&=
+\begin{cases}
+\mathbf{S}_{t-1}, & t \bmod T \neq 0 \\
+\mathbf{S}'_t, & t \bmod T = 0
+\end{cases}
+\\
+\boldsymbol{o}_t
+&=
+\left(
+\mathbf{S}'_t
+\right)^\top
+\boldsymbol{q}_t
+\in \mathbb{R}^{d_v}.
+\end{aligned}
+$$
